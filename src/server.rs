@@ -1,4 +1,7 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
 use anyhow::{Context, anyhow, bail};
 use hickory_resolver::{
@@ -118,12 +121,30 @@ impl Host {
     }
 }
 
+impl fmt::Display for Host {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Host::Ip(ip) => write!(f, "{ip}"),
+            Host::Name(name) => write!(f, "{name}"),
+        }
+    }
+}
+
+fn format_target(peer_addr: SocketAddr, destination: Option<(&Host, u16)>) -> String {
+    match destination {
+        Some((Host::Ip(IpAddr::V6(ip)), port)) => format!("<{peer_addr},[{ip}]:{port}>"),
+        Some((host, port)) => format!("<{peer_addr},{host}:{port}>"),
+        None => format!("<{peer_addr},None>"),
+    }
+}
+
 async fn handle_client(
     client: TcpStream,
     peer_addr: SocketAddr,
     resolver: Resolver,
     config: AppConfig,
 ) -> anyhow::Result<()> {
+    info!(target = %format_target(peer_addr, None), "request target");
     let mut probe = [0_u8; PROBE_LEN];
     let read_n = timeout(config.handshake_timeout(), client.peek(&mut probe))
         .await
@@ -138,9 +159,9 @@ async fn handle_client(
     debug!(peer = %peer_addr, protocol = ?protocol, "protocol detected");
 
     match protocol {
-        Protocol::Socks4 => handle_socks4(client, resolver, &config).await,
-        Protocol::Socks5 => handle_socks5(client, resolver, &config).await,
-        Protocol::HttpConnect => handle_http_connect(client, resolver, &config).await,
+        Protocol::Socks4 => handle_socks4(client, peer_addr, resolver, &config).await,
+        Protocol::Socks5 => handle_socks5(client, peer_addr, resolver, &config).await,
+        Protocol::HttpConnect => handle_http_connect(client, peer_addr, resolver, &config).await,
     }
 }
 
@@ -163,6 +184,7 @@ fn detect_protocol(data: &[u8]) -> Option<Protocol> {
 
 async fn handle_socks5(
     mut client: TcpStream,
+    peer_addr: SocketAddr,
     resolver: Resolver,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
@@ -199,10 +221,14 @@ async fn handle_socks5(
             return Err(err);
         }
     };
+    info!(
+        target = %format_target(peer_addr, Some((&host, port))),
+        "request target"
+    );
 
     match cmd {
         0x01 => handle_socks5_connect(client, resolver, config, host, port).await,
-        0x03 => handle_socks5_udp_associate(client, resolver, host, port).await,
+        0x03 => handle_socks5_udp_associate(client, peer_addr, resolver, host, port).await,
         _ => {
             send_socks5_reply(
                 &mut client,
@@ -249,6 +275,7 @@ async fn handle_socks5_connect(
 
 async fn handle_socks5_udp_associate(
     mut control: TcpStream,
+    peer_addr: SocketAddr,
     resolver: Resolver,
     requested_host: Host,
     requested_port: u16,
@@ -294,6 +321,10 @@ async fn handle_socks5_udp_associate(
 
                 if Some(source_addr) == client_udp_addr {
                     let (host, port, payload) = parse_socks5_udp_request(&udp_buf[..packet_len])?;
+                    info!(
+                        target = %format_target(peer_addr, Some((&host, port))),
+                        "request target"
+                    );
                     let payload = payload.to_vec();
                     let target = host.resolve(&resolver, port).await?;
                     udp_socket
@@ -448,6 +479,7 @@ async fn send_socks5_reply(
 
 async fn handle_socks4(
     mut client: TcpStream,
+    peer_addr: SocketAddr,
     resolver: Resolver,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
@@ -475,6 +507,10 @@ async fn handle_socks4(
     } else {
         Host::Ip(IpAddr::V4(Ipv4Addr::from(ip)))
     };
+    info!(
+        target = %format_target(peer_addr, Some((&host, port))),
+        "request target"
+    );
 
     let target_addr = host.resolve(&resolver, port).await?;
     let connect_result = timeout(config.connect_timeout(), TcpStream::connect(target_addr))
@@ -518,6 +554,7 @@ async fn read_null_terminated(stream: &mut TcpStream, max_len: usize) -> anyhow:
 
 async fn handle_http_connect(
     mut client: TcpStream,
+    peer_addr: SocketAddr,
     resolver: Resolver,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
@@ -540,6 +577,10 @@ async fn handle_http_connect(
     }
 
     let (host, port) = parse_authority(authority)?;
+    info!(
+        target = %format_target(peer_addr, Some((&host, port))),
+        "request target"
+    );
     let target_addr = host.resolve(&resolver, port).await?;
     let connect_result = timeout(config.connect_timeout(), TcpStream::connect(target_addr))
         .await

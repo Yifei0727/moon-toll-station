@@ -11,7 +11,7 @@ permissions:
 
 env:
   BINARY_NAME: auto-server
-  IMAGE_NAME: ghcr.io/yifei0727/gateway-toll-station
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/moon-toll-station
 
 jobs:
   build-linux:
@@ -21,12 +21,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - target: x86_64-unknown-linux-gnu
+            artifact: auto-server-linux-x86_64-unknown-linux-gnu
           - target: x86_64-unknown-linux-musl
             artifact: auto-server-linux-x86_64-unknown-linux-musl
-            suffix: amd64
+          - target: aarch64-unknown-linux-gnu
+            artifact: auto-server-linux-aarch64-unknown-linux-gnu
           - target: aarch64-unknown-linux-musl
             artifact: auto-server-linux-aarch64-unknown-linux-musl
-            suffix: arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -34,7 +36,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install cross
-        run: cargo install cross --locked
+        uses: taiki-e/install-action@cross
 
       - name: Build binary
         run: cross build --release --locked --target ${{ matrix.target }}
@@ -43,12 +45,13 @@ jobs:
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/${BINARY_NAME} "dist/${{ matrix.artifact }}"
+          tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.tar.gz
           if-no-files-found: error
 
   build-windows:
@@ -63,19 +66,20 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Build binary
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --release --target x86_64-pc-windows-msvc --locked
 
       - name: Stage artifact
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target\x86_64-pc-windows-msvc\release\${env:BINARY_NAME}.exe dist\auto-server-windows-x86_64-pc-windows-msvc.exe
+          Copy-Item target\x86_64-pc-windows-msvc\release\${env:BINARY_NAME}.exe dist\${env:BINARY_NAME}.exe
+          Compress-Archive -Path dist\${env:BINARY_NAME}.exe -DestinationPath dist\auto-server-windows-x86_64-pc-windows-msvc.zip -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: auto-server-windows-x86_64-pc-windows-msvc
-          path: dist/auto-server-windows-x86_64-pc-windows-msvc.exe
+          path: dist/auto-server-windows-x86_64-pc-windows-msvc.zip
           if-no-files-found: error
 
   build-macos:
@@ -90,18 +94,19 @@ jobs:
           targets: aarch64-apple-darwin
 
       - name: Build binary
-        run: cargo build --release --target aarch64-apple-darwin
+        run: cargo build --release --target aarch64-apple-darwin --locked
 
       - name: Stage artifact
         run: |
           mkdir -p dist
-          cp target/aarch64-apple-darwin/release/${BINARY_NAME} dist/auto-server-macos-aarch64-apple-darwin
+          cp target/aarch64-apple-darwin/release/${BINARY_NAME} "dist/auto-server-macos-aarch64-apple-darwin"
+          tar -C dist -czf dist/auto-server-macos-aarch64-apple-darwin.tar.gz auto-server-macos-aarch64-apple-darwin
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: auto-server-macos-aarch64-apple-darwin
-          path: dist/auto-server-macos-aarch64-apple-darwin
+          path: dist/auto-server-macos-aarch64-apple-darwin.tar.gz
           if-no-files-found: error
 
   publish-release:
@@ -132,19 +137,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
+          - artifact: auto-server-linux-x86_64-unknown-linux-musl
             platform: linux/amd64
-            artifact: auto-server-linux-x86_64-unknown-linux-musl
             suffix: amd64
-          - target: aarch64-unknown-linux-musl
+          - artifact: auto-server-linux-aarch64-unknown-linux-musl
             platform: linux/arm64
-            artifact: auto-server-linux-aarch64-unknown-linux-musl
             suffix: arm64
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download binary
+      - name: Download binary artifact
         uses: actions/download-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -152,13 +155,14 @@ jobs:
 
       - name: Prepare Docker staging
         run: |
-          mv dist/${{ matrix.artifact }} dist/auto-server
+          tar -xzf "dist/${{ matrix.artifact }}.tar.gz" -C dist
+          mv "dist/${{ matrix.artifact }}" dist/auto-server
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx

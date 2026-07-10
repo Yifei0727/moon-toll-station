@@ -12,7 +12,10 @@ pub struct AppConfig {
     #[arg(long, default_value = "0.0.0.0:1080")]
     pub listen: SocketAddr,
 
-    #[arg(long, help = "Custom DNS server (e.g. 8.8.8.8:53)")]
+    #[arg(
+        long,
+        help = "Custom remote DNS server (e.g. 8.8.8.8:53). If omitted, a built-in remote resolver set is used."
+    )]
     pub dns_server: Option<SocketAddr>,
 
     #[arg(long, default_value_t = 5000)]

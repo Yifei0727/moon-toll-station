@@ -73,8 +73,9 @@ impl Resolver {
                 let resolver_config = ResolverConfig::from_parts(None, vec![], nameservers);
                 TokioAsyncResolver::tokio(resolver_config, ResolverOpts::default())
             }
-            None => TokioAsyncResolver::tokio_from_system_conf()
-                .context("failed to create system DNS resolver")?,
+            None => {
+                TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default())
+            }
         };
         Ok(Self { inner })
     }
@@ -208,6 +209,15 @@ async fn handle_socks5(
     if req_head[0] != 0x05 {
         bail!("invalid SOCKS5 request version");
     }
+    if req_head[2] != 0x00 {
+        send_socks5_reply(
+            &mut client,
+            0x01,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        )
+        .await?;
+        bail!("invalid SOCKS5 reserved byte {}", req_head[2]);
+    }
     let cmd = req_head[1];
     let (host, port) = match read_socks5_target_from_stream(&mut client, req_head[3]).await {
         Ok(target) => target,
@@ -228,6 +238,7 @@ async fn handle_socks5(
 
     match cmd {
         0x01 => handle_socks5_connect(client, resolver, config, host, port).await,
+        0x02 => handle_socks5_bind(client, resolver, config, host, port).await,
         0x03 => handle_socks5_udp_associate(client, peer_addr, resolver, host, port).await,
         _ => {
             send_socks5_reply(
@@ -239,6 +250,48 @@ async fn handle_socks5(
             bail!("unsupported SOCKS5 command {cmd}");
         }
     }
+}
+
+async fn handle_socks5_bind(
+    mut client: TcpStream,
+    resolver: Resolver,
+    config: &AppConfig,
+    host: Host,
+    port: u16,
+) -> anyhow::Result<()> {
+    let expected_peer = host.resolve(&resolver, port).await?;
+    let bind_addr = match expected_peer.ip() {
+        IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        IpAddr::V6(_) => SocketAddr::new(IpAddr::from([0_u8; 16]), 0),
+    };
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .context("SOCKS5 BIND listen failed")?;
+    let local_bind = listener
+        .local_addr()
+        .context("failed to read SOCKS5 BIND local addr")?;
+    send_socks5_reply(&mut client, 0x00, local_bind).await?;
+
+    let accept_result = timeout(config.connect_timeout(), listener.accept())
+        .await
+        .context("SOCKS5 BIND accept timeout")?;
+    let (mut upstream, accepted_addr) = accept_result.context("SOCKS5 BIND accept failed")?;
+    if accepted_addr.ip() != expected_peer.ip() {
+        send_socks5_reply(
+            &mut client,
+            0x02,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        )
+        .await?;
+        bail!(
+            "SOCKS5 BIND accepted unexpected peer: expected {}, got {}",
+            expected_peer.ip(),
+            accepted_addr.ip()
+        );
+    }
+
+    send_socks5_reply(&mut client, 0x00, accepted_addr).await?;
+    tunnel(&mut client, &mut upstream).await
 }
 
 async fn handle_socks5_connect(
@@ -320,7 +373,18 @@ async fn handle_socks5_udp_associate(
                 }
 
                 if Some(source_addr) == client_udp_addr {
-                    let (host, port, payload) = parse_socks5_udp_request(&udp_buf[..packet_len])?;
+                    let parse_result = parse_socks5_udp_request(&udp_buf[..packet_len]);
+                    let (host, port, payload, frag) = match parse_result {
+                        Ok(parsed) => parsed,
+                        Err(err) => {
+                            debug!(peer = %peer_addr, error = %err, "invalid SOCKS5 UDP request packet");
+                            continue;
+                        }
+                    };
+                    if frag != 0 {
+                        debug!(peer = %peer_addr, frag, "dropping fragmented SOCKS5 UDP packet");
+                        continue;
+                    }
                     info!(
                         target = %format_target(peer_addr, Some((&host, port))),
                         "request target"
@@ -380,16 +444,14 @@ async fn read_socks5_host_from_stream(stream: &mut TcpStream, atyp: u8) -> anyho
     }
 }
 
-fn parse_socks5_udp_request(packet: &[u8]) -> anyhow::Result<(Host, u16, &[u8])> {
+fn parse_socks5_udp_request(packet: &[u8]) -> anyhow::Result<(Host, u16, &[u8], u8)> {
     if packet.len() < 4 {
         bail!("SOCKS5 UDP packet too short");
     }
     if packet[0] != 0 || packet[1] != 0 {
         bail!("SOCKS5 UDP packet has invalid RSV");
     }
-    if packet[2] != 0 {
-        bail!("SOCKS5 UDP fragmentation is not supported");
-    }
+    let frag = packet[2];
 
     let (host, addr_end) = parse_socks5_host_from_bytes(packet[3], &packet[4..])?;
     let port_slice = packet
@@ -400,7 +462,7 @@ fn parse_socks5_udp_request(packet: &[u8]) -> anyhow::Result<(Host, u16, &[u8])>
         .get(addr_end + 6..)
         .ok_or_else(|| anyhow!("SOCKS5 UDP packet missing payload"))?;
 
-    Ok((host, port, payload))
+    Ok((host, port, payload, frag))
 }
 
 fn parse_socks5_host_from_bytes(atyp: u8, data: &[u8]) -> anyhow::Result<(Host, usize)> {
@@ -731,11 +793,13 @@ mod tests {
             0x00, 0x00, 0x00, 0x03, 0x0b, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c',
             b'o', b'm', 0x01, 0xbb, 0xde, 0xad, 0xbe, 0xef,
         ];
-        let (host, port, payload) = parse_socks5_udp_request(&request).expect("parse udp request");
+        let (host, port, payload, frag) =
+            parse_socks5_udp_request(&request).expect("parse udp request");
         match host {
             Host::Name(name) => assert_eq!(name, "example.com"),
             _ => panic!("expected domain host"),
         }
+        assert_eq!(frag, 0);
         assert_eq!(port, 443);
         assert_eq!(payload, [0xde, 0xad, 0xbe, 0xef]);
 

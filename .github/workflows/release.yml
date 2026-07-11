@@ -11,7 +11,6 @@ permissions:
 
 env:
   BINARY_NAME: auto-server
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/moon-toll-station
 
 jobs:
   build-linux:
@@ -152,6 +151,9 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: dist
+
+      - name: Prepare image name
+        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/moon-toll-station" >> "$GITHUB_ENV"
 
       - name: Prepare Docker staging
         run: |

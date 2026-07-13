@@ -26,6 +26,18 @@ pub struct AppConfig {
 
     #[arg(long, value_enum, default_value_t = LogLevel::Info)]
     pub log_level: LogLevel,
+
+    #[arg(
+        long,
+        help = "Enable automatic upgrade check from GitHub (e.g. 1h, 3d, 1w, 1m)"
+    )]
+    pub auto_upgrade: Option<String>,
+
+    #[arg(
+        long,
+        help = "Allow upgrading to pre-release versions (e.g. beta, rc)"
+    )]
+    pub pre_release: bool,
 }
 
 impl AppConfig {

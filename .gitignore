@@ -1,3 +1,4 @@
 /target
 /dist
 /deploy.sh
+/cleanup-komari.sh

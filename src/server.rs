@@ -17,6 +17,13 @@ use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
 
+fn is_loopback_or_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => ipv4.is_loopback() || ipv4.octets()[0] == 0,
+        IpAddr::V6(ipv6) => ipv6.is_loopback() || ipv6.is_unspecified(),
+    }
+}
+
 const HTTP_HEADER_MAX_LEN: usize = 8192;
 const SOCKS4_FIELD_MAX_LEN: usize = 1024;
 const PROBE_LEN: usize = 512;
@@ -239,7 +246,7 @@ async fn handle_socks5(
     match cmd {
         0x01 => handle_socks5_connect(client, resolver, config, host, port).await,
         0x02 => handle_socks5_bind(client, resolver, config, host, port).await,
-        0x03 => handle_socks5_udp_associate(client, peer_addr, resolver, host, port).await,
+        0x03 => handle_socks5_udp_associate(client, peer_addr, resolver, config, host, port).await,
         _ => {
             send_socks5_reply(
                 &mut client,
@@ -260,6 +267,15 @@ async fn handle_socks5_bind(
     port: u16,
 ) -> anyhow::Result<()> {
     let expected_peer = host.resolve(&resolver, port).await?;
+    if config.no_loopback && is_loopback_or_local(expected_peer.ip()) {
+        send_socks5_reply(
+            &mut client,
+            0x02, // connection not allowed by ruleset
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        )
+        .await?;
+        bail!("SOCKS5 BIND blocked: target IP {} is loopback or local host", expected_peer.ip());
+    }
     let bind_addr = match expected_peer.ip() {
         IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         IpAddr::V6(_) => SocketAddr::new(IpAddr::from([0_u8; 16]), 0),
@@ -302,6 +318,15 @@ async fn handle_socks5_connect(
     port: u16,
 ) -> anyhow::Result<()> {
     let target_addr = host.resolve(&resolver, port).await?;
+    if config.no_loopback && is_loopback_or_local(target_addr.ip()) {
+        send_socks5_reply(
+            &mut client,
+            0x02, // connection not allowed by ruleset
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        )
+        .await?;
+        bail!("SOCKS5 connection blocked: target IP {} is loopback or local host", target_addr.ip());
+    }
     let connect_result = timeout(config.connect_timeout(), TcpStream::connect(target_addr))
         .await
         .context("SOCKS5 connect timeout")?;
@@ -330,6 +355,7 @@ async fn handle_socks5_udp_associate(
     mut control: TcpStream,
     peer_addr: SocketAddr,
     resolver: Resolver,
+    config: &AppConfig,
     requested_host: Host,
     requested_port: u16,
 ) -> anyhow::Result<()> {
@@ -391,6 +417,13 @@ async fn handle_socks5_udp_associate(
                     );
                     let payload = payload.to_vec();
                     let target = host.resolve(&resolver, port).await?;
+                    if config.no_loopback && is_loopback_or_local(target.ip()) {
+                        debug!(
+                            target = %target,
+                            "SOCKS5 UDP relay blocked target IP: loopback or local host"
+                        );
+                        continue;
+                    }
                     udp_socket
                         .send_to(&payload, target)
                         .await
@@ -575,6 +608,10 @@ async fn handle_socks4(
     );
 
     let target_addr = host.resolve(&resolver, port).await?;
+    if config.no_loopback && is_loopback_or_local(target_addr.ip()) {
+        send_socks4_reply(&mut client, 0x5B).await?; // request rejected
+        bail!("SOCKS4 connection blocked: target IP {} is loopback or local host", target_addr.ip());
+    }
     let connect_result = timeout(config.connect_timeout(), TcpStream::connect(target_addr))
         .await
         .context("SOCKS4 connect timeout")?;
@@ -644,6 +681,12 @@ async fn handle_http_connect(
         "request target"
     );
     let target_addr = host.resolve(&resolver, port).await?;
+    if config.no_loopback && is_loopback_or_local(target_addr.ip()) {
+        client
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+            .await?;
+        bail!("HTTP CONNECT connection blocked: target IP {} is loopback or local host", target_addr.ip());
+    }
     let connect_result = timeout(config.connect_timeout(), TcpStream::connect(target_addr))
         .await
         .context("HTTP CONNECT upstream connect timeout")?;
@@ -809,5 +852,19 @@ mod tests {
         assert_eq!(response[4..8], [1, 2, 3, 4]);
         assert_eq!(response[8..10], 5300_u16.to_be_bytes());
         assert_eq!(response[10..], [0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn test_is_loopback_or_local() {
+        use super::is_loopback_or_local;
+        assert!(is_loopback_or_local(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(is_loopback_or_local(IpAddr::V4(Ipv4Addr::new(127, 255, 255, 255))));
+        assert!(is_loopback_or_local(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
+        assert!(is_loopback_or_local(IpAddr::V4(Ipv4Addr::new(0, 1, 2, 3))));
+        assert!(!is_loopback_or_local(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_loopback_or_local(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(is_loopback_or_local(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(is_loopback_or_local(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+        assert!(!is_loopback_or_local(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))));
     }
 }

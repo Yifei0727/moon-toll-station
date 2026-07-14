@@ -38,6 +38,12 @@ pub struct AppConfig {
         help = "Allow upgrading to pre-release versions (e.g. beta, rc)"
     )]
     pub pre_release: bool,
+
+    #[arg(
+        long,
+        help = "Prohibit proxying traffic to loopback (127.0.0.0/8) and local (0.0.0.0/8) network addresses"
+    )]
+    pub no_loopback: bool,
 }
 
 impl AppConfig {

@@ -152,7 +152,7 @@ jobs:
   publish-docker:
     name: Publish Docker ${{ matrix.suffix }}
     runs-on: ubuntu-latest
-    needs: build-linux
+    needs: publish-release
     strategy:
       fail-fast: false
       matrix:

@@ -41,9 +41,15 @@ pub struct AppConfig {
 
     #[arg(
         long,
-        help = "Prohibit proxying traffic to loopback (127.0.0.0/8) and local (0.0.0.0/8) network addresses"
+        help = "Prohibit proxying traffic to loopback (127.0.0.0/8) and local (0.0.0.0/8) network addresses. Equivalent to --acl-no-rfc6890."
     )]
     pub no_loopback: bool,
+
+    #[arg(
+        long,
+        help = "Prohibit proxying traffic to RFC 6890 special-purpose addresses (private, loopback, link-local, CGNAT, multicast, reserved, documentation, etc.). Equivalent to --no-loopback."
+    )]
+    pub acl_no_rfc6890: bool,
 }
 
 impl AppConfig {
@@ -57,6 +63,13 @@ impl AppConfig {
 
     pub fn connect_timeout(&self) -> Duration {
         Duration::from_millis(self.connect_timeout_ms)
+    }
+
+    /// Whether destination addresses from the RFC 6890 special-purpose
+    /// registry (and the legacy loopback/local subset) must be blocked.
+    /// `--no-loopback` and `--acl-no-rfc6890` are equivalent.
+    pub fn block_special_addrs(&self) -> bool {
+        self.no_loopback || self.acl_no_rfc6890
     }
 }
 

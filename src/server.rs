@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
 use anyhow::{Context, anyhow, bail};
@@ -17,11 +17,52 @@ use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
 
-fn is_loopback_or_local(ip: IpAddr) -> bool {
+/// Returns `true` if `ip` belongs to an RFC 6890 IPv4/IPv6 special-purpose
+/// address range. These addresses must never be proxied to, whether the
+/// target was supplied directly or resolved from a domain name.
+fn is_rfc6890_special(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(ipv4) => ipv4.is_loopback() || ipv4.octets()[0] == 0,
-        IpAddr::V6(ipv6) => ipv6.is_loopback() || ipv6.is_unspecified(),
+        IpAddr::V4(ipv4) => is_rfc6890_special_v4(ipv4),
+        IpAddr::V6(ipv6) => is_rfc6890_special_v6(ipv6),
     }
+}
+
+fn is_rfc6890_special_v4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+
+    // "This" network 0.0.0.0/8 (RFC 1122) — source-only, never a valid target.
+    if o[0] == 0 {
+        return true;
+    }
+    // IETF protocol assignments 192.0.0.0/24 (RFC 6890), which covers the
+    // smaller delegated blocks (192.0.0.0/29, 192.0.0.8/32, 192.0.0.9/32,
+    // 192.0.0.10/32, 192.0.0.170/32, 192.0.0.171/32, etc.).
+    if o[0] == 192 && o[1] == 0 && o[2] == 0 {
+        return true;
+    }
+    // Shared address space / CGNAT 100.64.0.0/10 (RFC 6598).
+    if o[0] == 100 && (64..=127).contains(&o[1]) {
+        return true;
+    }
+
+    ip.is_unspecified()      // 0.0.0.0/32
+        || ip.is_loopback()  // 127.0.0.0/8
+        || ip.is_private()   // 10/8, 172.16/12, 192.168/16 (RFC 1918)
+        || ip.is_link_local() // 169.254.0.0/16
+        || ip.is_multicast() // 224.0.0.0/4
+        || ip.is_documentation() // 192.0.2/24, 198.51.100/24, 203.0.113/24
+        || (o[0] == 198 && (18..=19).contains(&o[1])) // 198.18.0.0/15 benchmark (RFC 2544)
+        || o[0] >= 240       // 240.0.0.0/4 reserved (RFC 1112), incl. 255.255.255.255
+}
+
+fn is_rfc6890_special_v6(ip: Ipv6Addr) -> bool {
+    let s = ip.segments();
+    ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_unique_local() // fc00::/7 (IPv6 private)
+        || ip.is_unicast_link_local() // fe80::/10
+        || ip.is_multicast()    // ff00::/8
+        || (s[0] == 0x2001 && s[1] == 0x0db8) // 2001:db8::/32 documentation
 }
 
 const HTTP_HEADER_MAX_LEN: usize = 8192;
@@ -267,14 +308,14 @@ async fn handle_socks5_bind(
     port: u16,
 ) -> anyhow::Result<()> {
     let expected_peer = host.resolve(&resolver, port).await?;
-    if config.no_loopback && is_loopback_or_local(expected_peer.ip()) {
+    if config.block_special_addrs() && is_rfc6890_special(expected_peer.ip()) {
         send_socks5_reply(
             &mut client,
             0x02, // connection not allowed by ruleset
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         )
         .await?;
-        bail!("SOCKS5 BIND blocked: target IP {} is loopback or local host", expected_peer.ip());
+        bail!("SOCKS5 BIND blocked: target IP {} is a special-purpose (RFC 6890) address", expected_peer.ip());
     }
     let bind_addr = match expected_peer.ip() {
         IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -318,14 +359,14 @@ async fn handle_socks5_connect(
     port: u16,
 ) -> anyhow::Result<()> {
     let target_addr = host.resolve(&resolver, port).await?;
-    if config.no_loopback && is_loopback_or_local(target_addr.ip()) {
+    if config.block_special_addrs() && is_rfc6890_special(target_addr.ip()) {
         send_socks5_reply(
             &mut client,
             0x02, // connection not allowed by ruleset
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         )
         .await?;
-        bail!("SOCKS5 connection blocked: target IP {} is loopback or local host", target_addr.ip());
+        bail!("SOCKS5 connection blocked: target IP {} is a special-purpose (RFC 6890) address", target_addr.ip());
     }
     let connect_result = timeout(config.connect_timeout(), TcpStream::connect(target_addr))
         .await
@@ -417,10 +458,10 @@ async fn handle_socks5_udp_associate(
                     );
                     let payload = payload.to_vec();
                     let target = host.resolve(&resolver, port).await?;
-                    if config.no_loopback && is_loopback_or_local(target.ip()) {
+                    if config.block_special_addrs() && is_rfc6890_special(target.ip()) {
                         debug!(
                             target = %target,
-                            "SOCKS5 UDP relay blocked target IP: loopback or local host"
+                            "SOCKS5 UDP relay blocked target IP: special-purpose (RFC 6890) address"
                         );
                         continue;
                     }
@@ -608,9 +649,9 @@ async fn handle_socks4(
     );
 
     let target_addr = host.resolve(&resolver, port).await?;
-    if config.no_loopback && is_loopback_or_local(target_addr.ip()) {
+    if config.block_special_addrs() && is_rfc6890_special(target_addr.ip()) {
         send_socks4_reply(&mut client, 0x5B).await?; // request rejected
-        bail!("SOCKS4 connection blocked: target IP {} is loopback or local host", target_addr.ip());
+        bail!("SOCKS4 connection blocked: target IP {} is a special-purpose (RFC 6890) address", target_addr.ip());
     }
     let connect_result = timeout(config.connect_timeout(), TcpStream::connect(target_addr))
         .await
@@ -681,11 +722,11 @@ async fn handle_http_connect(
         "request target"
     );
     let target_addr = host.resolve(&resolver, port).await?;
-    if config.no_loopback && is_loopback_or_local(target_addr.ip()) {
+    if config.block_special_addrs() && is_rfc6890_special(target_addr.ip()) {
         client
             .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
             .await?;
-        bail!("HTTP CONNECT connection blocked: target IP {} is loopback or local host", target_addr.ip());
+        bail!("HTTP CONNECT connection blocked: target IP {} is a special-purpose (RFC 6890) address", target_addr.ip());
     }
     let connect_result = timeout(config.connect_timeout(), TcpStream::connect(target_addr))
         .await
@@ -855,16 +896,51 @@ mod tests {
     }
 
     #[test]
-    fn test_is_loopback_or_local() {
-        use super::is_loopback_or_local;
-        assert!(is_loopback_or_local(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-        assert!(is_loopback_or_local(IpAddr::V4(Ipv4Addr::new(127, 255, 255, 255))));
-        assert!(is_loopback_or_local(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
-        assert!(is_loopback_or_local(IpAddr::V4(Ipv4Addr::new(0, 1, 2, 3))));
-        assert!(!is_loopback_or_local(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
-        assert!(!is_loopback_or_local(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
-        assert!(is_loopback_or_local(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert!(is_loopback_or_local(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
-        assert!(!is_loopback_or_local(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))));
+    fn test_is_rfc6890_special() {
+        use super::is_rfc6890_special;
+
+        // RFC 6890 special-purpose addresses that must be blocked.
+        let blocked = [
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),       // 0.0.0.0/32
+            IpAddr::V4(Ipv4Addr::new(0, 1, 2, 3)),       // "this" network 0.0.0.0/8
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),      // 10.0.0.0/8 private
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),    // 100.64.0.0/10 CGNAT
+            IpAddr::V4(Ipv4Addr::new(100, 127, 255, 255)), // 100.64.0.0/10 edge
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),     // 127.0.0.0/8 loopback
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),   // 169.254.0.0/16 link-local
+            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),    // 172.16.0.0/12 private
+            IpAddr::V4(Ipv4Addr::new(192, 0, 0, 0)),     // 192.0.0.0/24 IETF
+            IpAddr::V4(Ipv4Addr::new(192, 0, 0, 170)),   // NAT64 discovery
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),     // 192.0.2.0/24 TEST-NET-1
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),   // 192.168.0.0/16 private
+            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),    // 198.18.0.0/15 benchmark
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),  // 198.51.100.0/24 TEST-NET-2
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),   // 203.0.113.0/24 TEST-NET-3
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),     // 224.0.0.0/4 multicast
+            IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1)),     // 240.0.0.0/4 reserved
+            IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), // limited broadcast
+            IpAddr::V6(Ipv6Addr::LOCALHOST),             // ::1 loopback
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),           // :: unspecified
+            IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)), // unique local
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), // link-local
+            IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)), // multicast
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), // documentation
+        ];
+        for ip in blocked {
+            assert!(is_rfc6890_special(ip), "{ip} should be special");
+        }
+
+        // Genuinely public/global addresses that must NOT be blocked.
+        let allowed = [
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(100, 63, 255, 255)),  // just below CGNAT
+            IpAddr::V4(Ipv4Addr::new(100, 128, 0, 0)),      // just above CGNAT
+            IpAddr::V4(Ipv4Addr::new(192, 1, 2, 3)),        // outside 192.0.0.0/24
+            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 1)), // global unicast
+        ];
+        for ip in allowed {
+            assert!(!is_rfc6890_special(ip), "{ip} should NOT be special");
+        }
     }
 }

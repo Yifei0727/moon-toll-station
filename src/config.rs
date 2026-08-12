@@ -1,13 +1,51 @@
 use std::{net::SocketAddr, time::Duration};
 
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::Level;
 
-#[derive(Debug, Clone, Parser)]
+/// Top-level CLI: optional server configuration flags plus an optional subcommand.
+#[derive(Debug, Parser)]
 #[command(
     name = "auto-server",
     about = "SOCKS + HTTP CONNECT auto-detect proxy server"
 )]
+pub struct Cli {
+    #[command(flatten)]
+    pub config: AppConfig,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Manage auto-server as a system service (Linux only)
+    Service(ServiceCommand),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl From<LogLevel> for Level {
+    fn from(value: LogLevel) -> Self {
+        match value {
+            LogLevel::Trace => Level::TRACE,
+            LogLevel::Debug => Level::DEBUG,
+            LogLevel::Info => Level::INFO,
+            LogLevel::Warn => Level::WARN,
+            LogLevel::Error => Level::ERROR,
+        }
+    }
+}
+
+/// Server runtime configuration.
+#[derive(Debug, Clone, Args)]
 pub struct AppConfig {
     #[arg(long, default_value = "0.0.0.0:1080")]
     pub listen: SocketAddr,
@@ -53,10 +91,6 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    pub fn from_args() -> Self {
-        Self::parse()
-    }
-
     pub fn handshake_timeout(&self) -> Duration {
         Duration::from_millis(self.handshake_timeout_ms)
     }
@@ -73,23 +107,22 @@ impl AppConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum LogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
+#[derive(Debug, Clone, Args)]
+pub struct ServiceCommand {
+    #[command(subcommand)]
+    pub action: ServiceAction,
 }
 
-impl From<LogLevel> for Level {
-    fn from(value: LogLevel) -> Self {
-        match value {
-            LogLevel::Trace => Level::TRACE,
-            LogLevel::Debug => Level::DEBUG,
-            LogLevel::Info => Level::INFO,
-            LogLevel::Warn => Level::WARN,
-            LogLevel::Error => Level::ERROR,
-        }
-    }
+#[derive(Debug, Clone, Subcommand)]
+pub enum ServiceAction {
+    /// Install auto-server as a system service (writes the unit/init script)
+    Install,
+    /// Enable the service to start automatically at boot
+    Enable,
+    /// Start the service through the system service manager
+    Start,
+    /// Stop the service through the system service manager
+    Stop,
+    /// Remove the service and clean up all files
+    Uninstall,
 }

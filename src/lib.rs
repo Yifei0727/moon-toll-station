@@ -1,9 +1,10 @@
 pub mod config;
 pub mod logging;
 pub mod server;
+pub mod service;
 pub mod upgrade;
 
-pub use config::AppConfig;
+pub use config::{AppConfig, Cli, Command};
 
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     if let Some(ref interval_str) = config.auto_upgrade {

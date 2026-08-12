@@ -23,7 +23,7 @@ mod imp {
     pub fn run(cmd: ServiceAction) -> anyhow::Result<()> {
         ensure_root()?;
         match cmd {
-            ServiceAction::Install { args } => install(&args),
+            ServiceAction::Install { args, bin_path } => install(&args, &bin_path),
             ServiceAction::Enable => enable(),
             ServiceAction::Start => start(),
             ServiceAction::Stop => stop(),
@@ -233,14 +233,22 @@ exit 0
         args.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
     }
 
-    fn install(args: &[String]) -> anyhow::Result<()> {
-        let bin = binary_path()?.display().to_string();
+    fn install(args: &[String], bin_path: &Option<String>) -> anyhow::Result<()> {
+        let bin = match bin_path {
+            Some(dest) => {
+                let src = binary_path()?;
+                copy_binary(&src, dest)?;
+                dest.clone()
+            }
+            None => binary_path()?.display().to_string(),
+        };
         match detect_init()? {
             InitSystem::Systemd => {
                 write_file(SYSTEMD_UNIT_PATH, &systemd_unit(&bin, args), 0o644)
                     .context("failed to write systemd unit file")?;
                 run_cmd("systemctl", &["daemon-reload"]).context("failed to reload systemd")?;
                 println!("Installed systemd unit at {SYSTEMD_UNIT_PATH}");
+                println!("ExecStart uses binary: {bin}");
                 if args.is_empty() {
                     println!("Next: `auto-server service enable` then `auto-server service start`");
                 } else {
@@ -255,13 +263,43 @@ exit 0
                 write_file(SYSV_SCRIPT_PATH, &init_script(&bin, args), 0o755)
                     .context("failed to write OpenRC init script")?;
                 println!("Installed OpenRC init script at {SYSV_SCRIPT_PATH}");
+                println!("DAEMON uses binary: {bin}");
             }
             InitSystem::SysV => {
                 write_file(SYSV_SCRIPT_PATH, &init_script(&bin, args), 0o755)
                     .context("failed to write SysV init script")?;
                 println!("Installed SysV init script at {SYSV_SCRIPT_PATH}");
+                println!("DAEMON uses binary: {bin}");
             }
         }
+        Ok(())
+    }
+
+    /// Copy the running binary to `dest` (creating parent dirs if needed,
+    /// ensuring it is executable) and return the destination path.
+    fn copy_binary(src: &Path, dest: &str) -> anyhow::Result<()> {
+        let dest = if Path::new(dest).is_absolute() {
+            PathBuf::from(dest)
+        } else {
+            std::env::current_dir()
+                .with_context(|| "failed to determine current directory")?
+                .join(dest)
+        };
+        if let Some(parent) = dest.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create directory {}", parent.display()))?;
+            }
+        }
+        std::fs::copy(src, &dest)
+            .with_context(|| format!("failed to copy {} to {}", src.display(), dest.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("failed to set permissions on {}", dest.display()))?;
+        }
+        println!("Copied binary from {} to {}", src.display(), dest.display());
         Ok(())
     }
 
@@ -380,6 +418,15 @@ exit 0
             assert!(script.contains(r#"DAEMON_ARGS="'--listen' '0.0.0.0:9999'"#));
             // Unquoted expansion of DAEMON_ARGS splits into the forwarded args.
             assert!(script.contains(r#"setsid "$DAEMON" $DAEMON_ARGS >"$LOGFILE""#));
+        }
+
+        #[test]
+        fn copy_binary_writes_destination() {
+            let src = binary_path().unwrap();
+            let dest = std::env::temp_dir().join("auto-server-copy-test-bin");
+            copy_binary(&src, dest.to_str().unwrap()).unwrap();
+            assert!(dest.exists());
+            let _ = std::fs::remove_file(&dest);
         }
     }
 }

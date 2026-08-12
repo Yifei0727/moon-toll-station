@@ -118,8 +118,14 @@ pub enum ServiceAction {
     /// Install auto-server as a system service (writes the unit/init script)
     ///
     /// Any extra arguments after `--` are forwarded to the auto-server binary,
-    /// e.g. `auto-server service install -- --listen 0.0.0.0:9999 --acl-no-rfc6890`.
+    /// e.g. `auto-server service install --bin-path /usr/local/bin/auto-server -- --listen 0.0.0.0:9999 --acl-no-rfc6890`.
     Install {
+        /// Copy the running binary to this path and reference it in ExecStart /
+        /// DAEMON (e.g. /usr/local/bin/auto-server). If omitted, the running
+        /// binary's own (resolved) path is used.
+        #[arg(long = "bin-path")]
+        bin_path: Option<String>,
+
         /// Extra arguments forwarded to the auto-server binary (pass after `--`)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<String>,

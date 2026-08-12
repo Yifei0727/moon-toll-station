@@ -65,7 +65,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Build binary
-        run: cargo build --release --target x86_64-pc-windows-msvc --locked
+        run: cargo build --release --target x86_64-pc-windows-msvc
 
       - name: Stage artifact
         shell: pwsh
@@ -93,7 +93,7 @@ jobs:
           targets: aarch64-apple-darwin
 
       - name: Build binary
-        run: cargo build --release --target aarch64-apple-darwin --locked
+        run: cargo build --release --target aarch64-apple-darwin
 
       - name: Stage artifact
         run: |

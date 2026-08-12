@@ -435,6 +435,9 @@ exit 0
 pub use imp::run;
 
 #[cfg(not(target_os = "linux"))]
+use crate::config::ServiceAction;
+
+#[cfg(not(target_os = "linux"))]
 pub fn run(_cmd: ServiceAction) -> anyhow::Result<()> {
     anyhow::bail!("System service management is only supported on Linux.");
 }

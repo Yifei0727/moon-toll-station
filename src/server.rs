@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
@@ -155,7 +156,7 @@ enum Protocol {
     HttpConnect,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Host {
     Ip(IpAddr),
     Name(String),
@@ -416,10 +417,20 @@ async fn handle_socks5_udp_associate(
     let reply_addr = SocketAddr::new(control_local.ip(), udp_local.port());
     send_socks5_reply(&mut control, 0x00, reply_addr).await?;
 
-    let mut client_udp_addr = match requested_host {
+    // The client address is learned per-packet: any source that sends a
+    // well-formed SOCKS5 UDP request (RSV=0, FRAG=0) is the client. This lets
+    // QUIC clients migrate their source address (RFC 9000 §9) without the relay
+    // misrouting their packets as upstream responses. The original code locked
+    // `client_udp_addr` to the first source, which broke migration.
+    let mut client_udp_addr: Option<SocketAddr> = match requested_host {
         Host::Ip(ip) if requested_port != 0 => Some(SocketAddr::new(ip, requested_port)),
         _ => None,
     };
+    // Cache resolved targets so DNS resolution + RFC 6890 checks run once per
+    // destination instead of on every datagram. A UDP relay must not add
+    // RTT-scale latency/jitter to each packet — QUIC's loss recovery is
+    // sensitive to it.
+    let mut target_cache: HashMap<(Host, u16), SocketAddr> = HashMap::new();
     let mut udp_buf = vec![0_u8; UDP_PACKET_MAX_LEN];
     let mut control_buf = [0_u8; 1];
     loop {
@@ -433,48 +444,63 @@ async fn handle_socks5_udp_associate(
                 debug!(read_n, "unexpected bytes on SOCKS5 UDP control channel");
             }
             recv_result = udp_socket.recv_from(&mut udp_buf) => {
-                let (packet_len, source_addr) = recv_result.context("UDP relay recv_from failed")?;
+                let (packet_len, source_addr) = match recv_result {
+                    Ok(x) => x,
+                    Err(err) => {
+                        debug!(peer = %peer_addr, error = %err, "UDP relay recv_from failed");
+                        continue;
+                    }
+                };
 
-                if client_udp_addr.is_none() {
-                    client_udp_addr = Some(source_addr);
-                }
-
-                if Some(source_addr) == client_udp_addr {
-                    let parse_result = parse_socks5_udp_request(&udp_buf[..packet_len]);
-                    let (host, port, payload, frag) = match parse_result {
-                        Ok(parsed) => parsed,
-                        Err(err) => {
-                            debug!(peer = %peer_addr, error = %err, "invalid SOCKS5 UDP request packet");
+                // A client packet is a SOCKS5 UDP request wrapping the real
+                // payload (e.g. a QUIC datagram). A raw QUIC datagram from the
+                // upstream fails the SOCKS5 RSV check, so it is treated as a
+                // response. Distinguishing client vs upstream by *content* (not
+                // source address) is what makes QUIC connection migration safe.
+                match parse_socks5_udp_request(&udp_buf[..packet_len]) {
+                    Ok((host, port, payload, frag)) => {
+                        if frag != 0 {
+                            debug!(peer = %peer_addr, frag, "dropping fragmented SOCKS5 UDP packet");
                             continue;
                         }
-                    };
-                    if frag != 0 {
-                        debug!(peer = %peer_addr, frag, "dropping fragmented SOCKS5 UDP packet");
-                        continue;
+                        client_udp_addr = Some(source_addr);
+                        let payload = payload.to_vec();
+                        let target = match target_cache.get(&(host.clone(), port)) {
+                            Some(t) => *t,
+                            None => {
+                                let t = match host.resolve(&resolver, port).await {
+                                    Ok(t) => t,
+                                    Err(err) => {
+                                        debug!(peer = %peer_addr, error = %err, "SOCKS5 UDP relay target resolution failed");
+                                        continue;
+                                    }
+                                };
+                                if config.block_special_addrs() && is_rfc6890_special(t.ip()) {
+                                    debug!(target = %t, "SOCKS5 UDP relay blocked target IP: special-purpose (RFC 6890) address");
+                                    continue;
+                                }
+                                target_cache.insert((host.clone(), port), t);
+                                t
+                            }
+                        };
+                        if let Err(err) = udp_socket.send_to(&payload, target).await {
+                            debug!(peer = %peer_addr, target = %target, error = %err, "UDP relay send_to target failed");
+                            continue;
+                        }
                     }
-                    info!(
-                        target = %format_target(peer_addr, Some((&host, port))),
-                        "request target"
-                    );
-                    let payload = payload.to_vec();
-                    let target = host.resolve(&resolver, port).await?;
-                    if config.block_special_addrs() && is_rfc6890_special(target.ip()) {
-                        debug!(
-                            target = %target,
-                            "SOCKS5 UDP relay blocked target IP: special-purpose (RFC 6890) address"
-                        );
-                        continue;
+                    Err(_) => {
+                        // Not a SOCKS5 UDP request -> upstream response; relay
+                        // it back to the client. A single dropped datagram must
+                        // not tear down the whole session, so send errors are
+                        // logged and skipped instead of propagated.
+                        if let Some(client_addr) = client_udp_addr {
+                            let response = build_socks5_udp_response(source_addr, &udp_buf[..packet_len]);
+                            if let Err(err) = udp_socket.send_to(&response, client_addr).await {
+                                debug!(peer = %peer_addr, client = %client_addr, error = %err, "UDP relay send_to client failed");
+                                continue;
+                            }
+                        }
                     }
-                    udp_socket
-                        .send_to(&payload, target)
-                        .await
-                        .with_context(|| format!("UDP relay send_to target {target} failed"))?;
-                } else if let Some(client_addr) = client_udp_addr {
-                    let response = build_socks5_udp_response(source_addr, &udp_buf[..packet_len]);
-                    udp_socket
-                        .send_to(&response, client_addr)
-                        .await
-                        .with_context(|| format!("UDP relay send_to client {client_addr} failed"))?;
                 }
             }
         }

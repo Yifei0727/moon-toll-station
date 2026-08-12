@@ -23,11 +23,11 @@ mod imp {
     pub fn run(cmd: ServiceAction) -> anyhow::Result<()> {
         ensure_root()?;
         match cmd {
-        ServiceAction::Install => install(),
-        ServiceAction::Enable => enable(),
-        ServiceAction::Start => start(),
-        ServiceAction::Stop => stop(),
-        ServiceAction::Uninstall => uninstall(),
+            ServiceAction::Install { args } => install(&args),
+            ServiceAction::Enable => enable(),
+            ServiceAction::Start => start(),
+            ServiceAction::Stop => stop(),
+            ServiceAction::Uninstall => uninstall(),
         }
     }
 
@@ -127,7 +127,7 @@ mod imp {
         Ok(())
     }
 
-    fn systemd_unit(bin: &str) -> String {
+    fn systemd_unit(bin: &str, args: &[String]) -> String {
         format!(
             r#"[Unit]
 Description=auto-server SOCKS + HTTP CONNECT proxy
@@ -136,20 +136,35 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={bin}
+ExecStart={exec}
 Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-"#
+"#,
+            exec = systemd_exec(bin, args)
         )
+    }
+
+    /// Quote a single token for systemd's ExecStart parsing (double-quote
+    /// aware, with backslash escaping).
+    fn systemd_quote(s: &str) -> String {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    fn systemd_exec(bin: &str, args: &[String]) -> String {
+        let mut parts = vec![systemd_quote(bin)];
+        for a in args {
+            parts.push(systemd_quote(a));
+        }
+        parts.join(" ")
     }
 
     /// A portable POSIX init script that works with both OpenRC (`rc-service`)
     /// and SysV (`service`). It detaches the daemon with `setsid` and tracks a
     /// pidfile so stop/status work without `start-stop-daemon`.
-    fn init_script(bin: &str) -> String {
+    fn init_script(bin: &str, args: &[String]) -> String {
         format!(
             r#"#!/bin/sh
 ### BEGIN INIT INFO
@@ -164,6 +179,7 @@ WantedBy=multi-user.target
 
 NAME=auto-server
 DAEMON="{bin}"
+DAEMON_ARGS="{args}"
 PIDFILE=/var/run/auto-server.pid
 LOGFILE=/var/log/auto-server.log
 
@@ -173,7 +189,7 @@ start() {{
         return 0
     fi
     echo "Starting $NAME..."
-    setsid "$DAEMON" >"$LOGFILE" 2>&1 < /dev/null &
+    setsid "$DAEMON" $DAEMON_ARGS >"$LOGFILE" 2>&1 < /dev/null &
     echo $! > "$PIDFILE"
     return 0
 }}
@@ -203,27 +219,45 @@ case "$1" in
     *) echo "Usage: $0 {{start|stop|restart|status}}"; exit 1 ;;
 esac
 exit 0
-"#
+"#,
+            args = sh_quote_join(args)
         )
     }
 
-    fn install() -> anyhow::Result<()> {
+    /// Single-quote a token for shell (POSIX) usage, escaping embedded quotes.
+    fn sh_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+
+    fn sh_quote_join(args: &[String]) -> String {
+        args.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
+    }
+
+    fn install(args: &[String]) -> anyhow::Result<()> {
         let bin = binary_path()?.display().to_string();
         match detect_init()? {
             InitSystem::Systemd => {
-                write_file(SYSTEMD_UNIT_PATH, &systemd_unit(&bin), 0o644)
+                write_file(SYSTEMD_UNIT_PATH, &systemd_unit(&bin, args), 0o644)
                     .context("failed to write systemd unit file")?;
                 run_cmd("systemctl", &["daemon-reload"]).context("failed to reload systemd")?;
                 println!("Installed systemd unit at {SYSTEMD_UNIT_PATH}");
-                println!("Next: `auto-server service enable` then `auto-server service start`");
+                if args.is_empty() {
+                    println!("Next: `auto-server service enable` then `auto-server service start`");
+                } else {
+                    println!(
+                        "Forwarded args: {}",
+                        args.join(" ")
+                    );
+                    println!("Next: `auto-server service enable` then `auto-server service start`");
+                }
             }
             InitSystem::OpenRc => {
-                write_file(SYSV_SCRIPT_PATH, &init_script(&bin), 0o755)
+                write_file(SYSV_SCRIPT_PATH, &init_script(&bin, args), 0o755)
                     .context("failed to write OpenRC init script")?;
                 println!("Installed OpenRC init script at {SYSV_SCRIPT_PATH}");
             }
             InitSystem::SysV => {
-                write_file(SYSV_SCRIPT_PATH, &init_script(&bin), 0o755)
+                write_file(SYSV_SCRIPT_PATH, &init_script(&bin, args), 0o755)
                     .context("failed to write SysV init script")?;
                 println!("Installed SysV init script at {SYSV_SCRIPT_PATH}");
             }
@@ -312,18 +346,40 @@ exit 0
 
         #[test]
         fn systemd_unit_contains_exec_start() {
-            let unit = systemd_unit("/opt/bin/auto-server");
-            assert!(unit.contains("ExecStart=/opt/bin/auto-server"));
+            let unit = systemd_unit("/opt/bin/auto-server", &[]);
+            assert!(unit.contains(r#"ExecStart="/opt/bin/auto-server""#));
             assert!(unit.contains("WantedBy=multi-user.target"));
         }
 
         #[test]
+        fn systemd_unit_forwards_args() {
+            let unit = systemd_unit(
+                "/opt/bin/auto-server",
+                &["--listen".into(), "0.0.0.0:9999".into(), "--acl-no-rfc6890".into()],
+            );
+            assert!(unit.contains(
+                r#"ExecStart="/opt/bin/auto-server" "--listen" "0.0.0.0:9999" "--acl-no-rfc6890""#
+            ));
+        }
+
+        #[test]
         fn init_script_is_valid_sh_with_braces() {
-            let script = init_script("/opt/bin/auto-server");
+            let script = init_script("/opt/bin/auto-server", &[]);
             // The Usage line must keep its literal braces (not a format arg).
             assert!(script.contains("Usage: $0 {start|stop|restart|status}"));
             assert!(script.contains(r#"DAEMON="/opt/bin/auto-server""#));
             assert!(script.contains("setsid"));
+        }
+
+        #[test]
+        fn init_script_forwards_args() {
+            let script = init_script(
+                "/opt/bin/auto-server",
+                &["--listen".into(), "0.0.0.0:9999".into()],
+            );
+            assert!(script.contains(r#"DAEMON_ARGS="'--listen' '0.0.0.0:9999'"#));
+            // Unquoted expansion of DAEMON_ARGS splits into the forwarded args.
+            assert!(script.contains(r#"setsid "$DAEMON" $DAEMON_ARGS >"$LOGFILE""#));
         }
     }
 }

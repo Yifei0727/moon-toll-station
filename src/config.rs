@@ -116,7 +116,14 @@ pub struct ServiceCommand {
 #[derive(Debug, Clone, Subcommand)]
 pub enum ServiceAction {
     /// Install auto-server as a system service (writes the unit/init script)
-    Install,
+    ///
+    /// Any extra arguments after `--` are forwarded to the auto-server binary,
+    /// e.g. `auto-server service install -- --listen 0.0.0.0:9999 --acl-no-rfc6890`.
+    Install {
+        /// Extra arguments forwarded to the auto-server binary (pass after `--`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<String>,
+    },
     /// Enable the service to start automatically at boot
     Enable,
     /// Start the service through the system service manager

@@ -83,8 +83,9 @@ The `UDP ASSOCIATE` implementation is hardened specifically for QUIC's behavior:
 # 2. HTTP/3 MASQUE (CONNECT-UDP, RFC 9298) — new in this build
 
 `auto-server --enable h3` starts a **second, concurrent** listener that speaks QUIC/HTTP/3 and
-implements MASQUE `CONNECT-UDP`. It runs *alongside* the existing TCP SOCKS/HTTP proxy — that
-proxy is unaffected and keeps serving on `--listen`.
+implements MASQUE `CONNECT-UDP`. By default it runs *alongside* the existing TCP SOCKS/HTTP proxy
+— that proxy is unaffected and keeps serving on `--listen`. Pass `--disable http` to run MASQUE
+**only** (see below).
 
 MASQUE lets an HTTP/HTTPS-proxy client tunnel UDP (and therefore QUIC) through the proxy without
 needing SOCKS5. The client opens an HTTP/3 connection, sends `CONNECT-UDP` with `:protocol:
@@ -112,10 +113,33 @@ auto-server --enable h3 --key xxx.pem --cert-chain xxxfull.chain.pem --udp-port 
 | `--cert-chain <PATH>` | PEM certificate chain (fullchain) for the QUIC/HTTP/3 listener. **Required** when `--enable h3`. |
 | `--auth-token <TOKEN>` | Shared secret. **Required** when `--enable h3`. See auth below. |
 | `--udp-port <PORT>` | UDP port for the QUIC listener. **Optional, default `443`.** Bound to `--listen`'s IP (so `--listen 0.0.0.0` → `0.0.0.0:443`), no separate bind-address flag is needed. |
+| `--disable http` | Do not start the TCP listener on `--listen` at all, so **only** MASQUE runs. Optional. Requires `--enable h3`. |
 
 `--key`, `--cert-chain`, and `--auth-token` are enforced by `clap` (`required_if_eq` on
 `--enable h3`) and re-checked defensively in `run()`. Omitting any of them aborts with a clear
 message before binding.
+
+### `--disable http` (MASQUE-only)
+
+The TCP listener on `--listen` serves SOCKS4, SOCKS5 **and** HTTP `CONNECT` together (it
+auto-detects the protocol per connection), so `--disable http` disables **all three** — it is not
+an HTTP-only toggle. With `--disable http`, `--listen` is never bound; only its IP is still used
+to derive the MASQUE bind address (`--listen`'s IP + `--udp-port`).
+
+```
+auto-server --enable h3 --disable http --key key.pem --cert-chain cert.pem --auth-token <TOKEN> --udp-port 8443
+```
+
+**Validation rule:** `--disable http` requires `--enable h3`. With no `--enable h3` there would
+be nothing listening at all, so the process fails fast — before binding anything and before the
+auto-upgrade loop starts — with:
+
+```
+Error: --disable http requires --enable h3: nothing would be listening
+```
+
+Auth (`--auth-token`), tunneling and datagram behavior are identical whether or not the TCP
+listener is disabled.
 
 ## Authentication (required)
 
@@ -174,6 +198,15 @@ auto-server --enable h3 --key key.pem --cert-chain cert.pem --auth-token s3cr3t 
 # 3. Missing auth-token is rejected before binding:
 auto-server --enable h3 --key key.pem --cert-chain cert.pem --udp-port 8443
 #    -> error: the following required arguments were not provided: --auth-token <AUTH_TOKEN>
+
+# 4. MASQUE-only: no TCP listener at all (1080 is never bound)
+auto-server --enable h3 --disable http --key key.pem --cert-chain cert.pem --auth-token s3cr3t --udp-port 8443
+#    -> only: "masque (HTTP/3 CONNECT-UDP) server started listen=0.0.0.0:8443"
+#       (no "proxy server started" line; nothing listening on 1080)
+
+# 5. --disable http without --enable h3 is rejected before binding:
+auto-server --disable http
+#    -> error: --disable http requires --enable h3: nothing would be listening
 ```
 
 ### Automated end-to-end test

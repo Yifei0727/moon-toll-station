@@ -5,9 +5,13 @@ pub mod server;
 pub mod service;
 pub mod upgrade;
 
-pub use config::{AppConfig, Cli, Command, EnableProtocol};
+pub use config::{AppConfig, Cli, Command, DisableProtocol, EnableProtocol};
 
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
+    // Validate before spawning or binding anything: a config that leaves the
+    // process serving nothing must fail immediately, not start and exit.
+    config.validate()?;
+
     if let Some(ref interval_str) = config.auto_upgrade {
         let interval = match upgrade::parse_interval(interval_str) {
             Ok(d) => d,
@@ -32,12 +36,19 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
                     "--enable h3 requires --key, --cert-chain and --auth-token to be set"
                 );
             }
-            let tcp = server::ProxyServer::new(config.clone())?;
-            let masque = masque::MasqueServer::new(config)?;
-            // Run both concurrently; if either stops with an error, surface it.
-            tokio::try_join!(tcp.run(), masque.run())?;
+            let masque = masque::MasqueServer::new(config.clone())?;
+            if config.run_tcp_proxy() {
+                let tcp = server::ProxyServer::new(config)?;
+                // Run both concurrently; if either stops with an error, surface it.
+                tokio::try_join!(tcp.run(), masque.run())?;
+            } else {
+                // --disable http: the TCP --listen port is never bound; MASQUE
+                // is the only listener.
+                masque.run().await?;
+            }
             Ok(())
         }
+        // `--disable http` never reaches here: `validate()` rejected it.
         None => server::ProxyServer::new(config)?.run().await,
     }
 }

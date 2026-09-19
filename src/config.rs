@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, time::Duration};
 
+use anyhow::bail;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::Level;
 
@@ -123,6 +124,13 @@ pub struct AppConfig {
         help = "UDP port for the QUIC/HTTP/3 MASQUE listener. Bound to --listen's IP. Default 443."
     )]
     pub udp_port: u16,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Disable a protocol mode. Currently only 'http', which disables the TCP listener on --listen that serves SOCKS4, SOCKS5 and HTTP CONNECT together (it is NOT an HTTP-only toggle: all three go away). Requires --enable h3, otherwise nothing would be listening."
+    )]
+    pub disable: Option<DisableProtocol>,
 }
 
 /// Protocol modes selectable via `--enable`.
@@ -130,6 +138,13 @@ pub struct AppConfig {
 pub enum EnableProtocol {
     /// HTTP/3 MASQUE (RFC 9298 CONNECT-UDP) over QUIC.
     H3,
+}
+
+/// Protocol modes selectable via `--disable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DisableProtocol {
+    /// The TCP listener on `--listen`: SOCKS4, SOCKS5 and HTTP CONNECT together.
+    Http,
 }
 
 impl AppConfig {
@@ -146,6 +161,23 @@ impl AppConfig {
     /// `--no-loopback` and `--acl-no-rfc6890` are equivalent.
     pub fn block_special_addrs(&self) -> bool {
         self.no_loopback || self.acl_no_rfc6890
+    }
+
+    /// Whether the TCP listener on `--listen` (SOCKS4 + SOCKS5 + HTTP CONNECT)
+    /// should be started. `--disable http` turns it off entirely: the port is
+    /// never bound, so only `--enable h3`'s MASQUE listener remains.
+    pub fn run_tcp_proxy(&self) -> bool {
+        !matches!(self.disable, Some(DisableProtocol::Http))
+    }
+
+    /// Cross-flag constraints that clap cannot express. Called before anything
+    /// is bound so a configuration that would leave the process serving nothing
+    /// fails fast with an actionable message.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.run_tcp_proxy() && !matches!(self.enable, Some(EnableProtocol::H3)) {
+            bail!("--disable http requires --enable h3: nothing would be listening");
+        }
+        Ok(())
     }
 }
 
@@ -180,4 +212,73 @@ pub enum ServiceAction {
     Stop,
     /// Remove the service and clean up all files
     Uninstall,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppConfig, Cli, DisableProtocol};
+    use clap::Parser;
+
+    fn config_from(args: &[&str]) -> AppConfig {
+        let mut argv = vec!["auto-server"];
+        argv.extend_from_slice(args);
+        Cli::parse_from(argv).config
+    }
+
+    /// Minimal arguments that satisfy `--enable h3`'s clap requirements.
+    const H3_ARGS: &[&str] = &[
+        "--enable",
+        "h3",
+        "--key",
+        "key.pem",
+        "--cert-chain",
+        "cert.pem",
+        "--auth-token",
+        "s3cr3t",
+    ];
+
+    #[test]
+    fn parses_disable_http() {
+        assert_eq!(config_from(&[]).disable, None);
+        assert_eq!(
+            config_from(&["--disable", "http"]).disable,
+            Some(DisableProtocol::Http)
+        );
+    }
+
+    #[test]
+    fn tcp_proxy_runs_unless_disabled() {
+        assert!(config_from(&[]).run_tcp_proxy());
+        assert!(config_from(H3_ARGS).run_tcp_proxy());
+        assert!(!config_from(&["--disable", "http"]).run_tcp_proxy());
+    }
+
+    #[test]
+    fn validate_rejects_disable_http_without_enable_h3() {
+        let err = config_from(&["--disable", "http"])
+            .validate()
+            .expect_err("disable http without enable h3 must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("--enable h3"),
+            "error should point at --enable h3, got: {message}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_disable_http_with_enable_h3() {
+        let mut args = H3_ARGS.to_vec();
+        args.extend_from_slice(&["--disable", "http"]);
+        config_from(&args)
+            .validate()
+            .expect("disable http + enable h3 is valid");
+    }
+
+    #[test]
+    fn validate_accepts_configs_that_listen_on_something() {
+        config_from(&[])
+            .validate()
+            .expect("default config is valid");
+        config_from(H3_ARGS).validate().expect("enable h3 is valid");
+    }
 }

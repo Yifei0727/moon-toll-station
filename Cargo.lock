@@ -104,6 +104,7 @@ dependencies = [
  "h3-quinn",
  "hickory-resolver",
  "http",
+ "percent-encoding",
  "quinn",
  "reqwest",
  "rustls",

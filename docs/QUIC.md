@@ -92,6 +92,42 @@ needing SOCKS5. The client opens an HTTP/3 connection, sends `CONNECT-UDP` with 
 connect-udp` and a `Capsule-Protocol: ?1` header, and then exchanges UDP payloads as HTTP/3
 DATAGRAMs (RFC 9297) whose body is a `DATAGRAM` capsule (type `0x00` = UDP payload, RFC 9298 §4).
 
+## Request form (RFC 9298 §3.4)
+
+The UDP target is carried in the **`:path`**, not in `:authority`. Per RFC 9298 §3.4, `:authority`
+is the **proxy's own authority** and `:path` is the expansion of the URI template. The normative
+example (RFC 9298 Figure 5) is:
+
+```
+:method = CONNECT
+:protocol = connect-udp
+:scheme = https
+:path = /.well-known/masque/udp/192.0.2.6/443/
+:authority = example.org
+capsule-protocol = ?1
+```
+
+We implement the **default** (IANA-registered) template from RFC 9298 §2 only:
+
+```
+https://$PROXY_HOST:$PROXY_PORT/.well-known/masque/udp/{target_host}/{target_port}/
+```
+
+Notes:
+
+- **Clients configure no path.** The `/.well-known/masque/udp/...` prefix is hardcoded per the
+  RFC's default template; it is not configurable, and a client never has to be told it.
+- `{target_host}` is percent-decoded (RFC 9298 §3.1), so an IPv6 literal may arrive as
+  `2001%3Adb8%3A%3A1`. Raw unencoded colons (`2001:db8::1`) are also accepted, because that is
+  what Chromium actually puts on the wire.
+- `{target_port}` must be present and numeric; there is no default port (RFC 9298 forbids an
+  omitted one). A missing, empty or non-numeric port is rejected with `400`.
+- `:authority` is **not** the target and is not used to derive it. It identifies the proxy, but
+  this server has no config for its own public authority, so it performs no authority matching —
+  it simply never treats `:authority` as the tunnel destination.
+- The obsolete `draft-schinazi-masque-connect-udp-00` encoding (target in `:authority`) is **not**
+  accepted, as a fallback or otherwise. No known client sends it.
+
 ## Why HTTP/3 (and not HTTP/2) MASQUE
 
 RFC 9298 requires HTTP DATAGRAM frames (RFC 9297) to carry UDP payloads. The mature Rust HTTP/2
@@ -154,9 +190,10 @@ responds `407 Proxy Authentication Required`. Two schemes are accepted:
 
 ## Tunneling model
 
-- A `CONNECT-UDP` request names exactly **one** target in its `:authority` (host **and explicit
-  port** — RFC 9298 forbids an omitted port). The server resolves it once (via the shared DNS
-  resolver), applies the same `--acl-no-rfc6890`/`--no-loopback` blocking as the TCP proxy
+- A `CONNECT-UDP` request names exactly **one** target in its `:path`, as
+  `/.well-known/masque/udp/{host}/{port}/` (host **and explicit port** — RFC 9298 forbids an
+  omitted port). The server resolves it once (via the shared DNS resolver), applies the same
+  `--acl-no-rfc6890`/`--no-loopback` blocking as the TCP proxy
   (`is_rfc6890_special`), and opens a single UDP socket to it.
 - The tunnel is **1:1**: unlike SOCKS5 `UDP ASSOCIATE` there is no per-packet destination header.
   Every datagram on that stream is relayed to/from that one socket. (The SOCKS5 content-based
@@ -172,6 +209,14 @@ responds `407 Proxy Authentication Required`. Two schemes are accepted:
 Configure the browser/system as an **HTTP/HTTPS proxy** pointing at `https://<host>:<udp-port>/`
 with the proxy auth credential above, and ensure HTTP/3 (QUIC) is enabled. Chrome, for example,
 tunnels QUIC to origins through an HTTP proxy via MASQUE `CONNECT-UDP` when so configured.
+
+**Do not configure a path.** The `/.well-known/masque/udp/{host}/{port}/` prefix is the RFC 9298
+default URI template, hardcoded on both sides — a proxy-config path (if your client even has such
+a field) is not used for `CONNECT-UDP` and setting one will not change the target.
+
+For interop testing, prefer the reference client from
+[masque-go](https://github.com/quic-go/masque-go) (see Limitations — Chrome is not usable against
+this server's mandatory auth).
 
 ## MTU / `TooLarge` limitation
 
@@ -213,9 +258,9 @@ auto-server --disable http
 
 `src/masque.rs` also contains `e2e_connect_udp_roundtrip` — a real handshake that drives the
 actual `MasqueServer` with a `quinn` + `h3` client over a freshly generated self-signed
-certificate, sends `CONNECT-UDP`, asserts `200`, and round-trips a UDP payload through a local
-echo socket via HTTP/3 DATAGRAM capsules. It is `#[ignore]`d (and a no-op if `openssl` is absent)
-so it does not run in the default `cargo test`:
+certificate, sends `CONNECT-UDP` (in the RFC 9298 `:path` form above), asserts `200`, and
+round-trips a UDP payload through a local echo socket via HTTP/3 DATAGRAM capsules. It is
+`#[ignore]`d (and a no-op if `openssl` is absent) so it does not run in the default `cargo test`:
 
 ```
 cargo test -- --ignored e2e_connect_udp_roundtrip
@@ -229,6 +274,19 @@ accepts it as an end-entity.
 
 ## Limitations
 
+- **Chrome cannot actually be used against this server today**, for two independent reasons:
+  - **Chrome's MASQUE client does not send `Proxy-Authorization`.** This is a known Chromium gap
+    tracked as `TODO(crbug.com/326437102)`; since our auth is mandatory, Chrome's `CONNECT-UDP`
+    requests always get `407 Proxy Authentication Required`. (There is no flag to work around it
+    from our side short of disabling auth, which we deliberately do not support on a public port.)
+  - **`quic://` proxy support is debug-build only in Chromium.** `enable_quic_proxy_support` is
+    gated on `is_debug`, so a shipping Chrome will not use a `quic://` proxy at all. Shipping
+    Chrome uses **connect-ip (RFC 9484)** instead, which this server does not implement.
+  Recommendation: test interop with [masque-go](https://github.com/quic-go/masque-go), which
+  implements RFC 9298 with configurable proxy auth.
+- **Only the default path template is implemented.** A client that negotiates a different
+  `CONNECT-UDP` URI template — e.g. one advertised via a query-string template variant — will have
+  its requests rejected with `400`. This matches every client we know of.
 - **SOCKS5 still required for non-MASQUE QUIC:** the MASQUE listener only handles HTTP/3
   `CONNECT-UDP`. Clients that cannot do HTTP/3 MASQUE (or want to tunnel non-UDP traffic) continue
   to use the SOCKS5/HTTP `CONNECT` proxy.

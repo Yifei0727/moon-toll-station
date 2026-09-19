@@ -31,6 +31,9 @@ bytes = "1"
 # MUST be "1" so it unifies with h3's http 1.x; otherwise send_response type
 # mismatches at compile time.
 http = "1"
+# Percent-decoding the RFC 9298 `{target_host}` path segment (`%3A` -> `:`).
+percent-encoding = "2"
+
 # Decoding the Proxy-Authorization: Basic challenge for CONNECT-UDP.
 base64 = "0.22"
 

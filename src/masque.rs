@@ -2,8 +2,8 @@
 //!
 //! This module terminates a QUIC/HTTP/3 connection and relays UDP datagrams
 //! between the client and a single upstream target named by the request's
-//! `:authority`. HTTP/3 MASQUE clients (e.g. Chrome) tunnel QUIC packets as
-//! HTTP/3 DATAGRAMs (RFC 9297) whose payload is a `DATAGRAM` capsule
+//! `:path` (RFC 9298 §3.4). HTTP/3 MASQUE clients (e.g. Chrome) tunnel QUIC
+//! packets as HTTP/3 DATAGRAMs (RFC 9297) whose payload is a `DATAGRAM` capsule
 //! (RFC 9297 §4 / RFC 9298 §4) carrying the raw UDP payload.
 //!
 //! Design notes (resolved empirically against the 0.0.x crates):
@@ -74,6 +74,11 @@ type Routes = Arc<Mutex<HashMap<StreamId, mpsc::UnboundedSender<Bytes>>>>;
 /// Quarter Stream ID varint, and the capsule's `Type`/`Length` varints when
 /// deciding whether an outgoing capsule fits the current datagram MTU.
 const DATAGRAM_OVERHEAD: usize = 8;
+
+/// Fixed prefix of the default (IANA-registered) `CONNECT-UDP` URI template,
+/// RFC 9298 §2:
+/// `https://$PROXY_HOST:$PROXY_PORT/.well-known/masque/udp/{target_host}/{target_port}/`
+const MASQUE_UDP_PATH_PREFIX: &str = "/.well-known/masque/udp/";
 
 const BASE64_ENGINE: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
@@ -306,8 +311,9 @@ where
 
     log_request(peer, &host, port, "udp", target, "masque");
 
-    // 1:1 tunnel to a single :authority target. Bind a UDP socket of the same
-    // address family and connect() it so recv/send are with the target only.
+    // 1:1 tunnel to the single target named by the :path. Bind a UDP socket of
+    // the same address family and connect() it so recv/send are with the target
+    // only.
     let bind_addr: SocketAddr = if target.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
@@ -448,24 +454,69 @@ fn check_proxy_auth(headers: &HeaderMap, token: Option<&str>) -> bool {
     false
 }
 
-/// Extract the `:authority` host + explicit port (RFC 9298 requires a port).
+/// Extract the CONNECT-UDP target from the request's `:path` (RFC 9298 §3.4).
+///
+/// RFC 9298 puts the UDP target in the **path**, not in `:authority`: `:authority`
+/// is the *proxy's* own authority, and `:path` is the expansion of the URI
+/// template. The normative example (RFC 9298 Figure 5) is:
+///
+/// ```text
+/// :path = /.well-known/masque/udp/192.0.2.6/443/
+/// :authority = example.org
+/// ```
+///
+/// We implement only the default (IANA-registered) template from RFC 9298 §2:
+/// `https://$PROXY_HOST:$PROXY_PORT/.well-known/masque/udp/{target_host}/{target_port}/`
+///
+/// The obsolete `draft-schinazi-masque-connect-udp-00` encoding (target in
+/// `:authority`) is deliberately **not** accepted as a fallback: no known client
+/// sends it, and honouring it would tunnel to the proxy itself.
+///
+/// NOTE on `:authority`: it is intentionally unused here. It identifies *us*,
+/// not the target, but this server has no config for its own public authority
+/// (the QUIC bind address is not necessarily the name clients connect to), so we
+/// do not try to match it. We simply must not mistake it for the target.
 fn parse_target(req: &Request<()>) -> Option<(Host, u16)> {
-    let auth = req.uri().authority()?;
-    let port = auth.port_u16()?; // explicit port is mandatory
-    // `Authority::host()` returns an IPv6 literal *with* its brackets, so strip
-    // them before parsing as an address (mirrors `parse_authority` in server.rs).
-    let raw = auth.host();
-    let host_str = if raw.starts_with('[') && raw.ends_with(']') {
-        &raw[1..raw.len() - 1]
-    } else {
-        raw
+    // Everything after the fixed prefix is `{target_host}/{target_port}` plus
+    // an optional trailing `/`. `splitn(3, '/')` keeps any trailing empty
+    // segment (and any junk after it) out of the two fields we read.
+    let rest = req.uri().path().strip_prefix(MASQUE_UDP_PATH_PREFIX)?;
+    let mut segments = rest.splitn(3, '/');
+    let host_seg = segments.next()?;
+    let port_seg = segments.next()?;
+
+    // A missing or empty segment means no target / no explicit port; RFC 9298
+    // forbids an omitted port, so reject rather than defaulting to 443.
+    if host_seg.is_empty() || port_seg.is_empty() {
+        return None;
+    }
+    let port: u16 = port_seg.parse().ok()?; // non-numeric port -> 400
+
+    Some((parse_target_host(host_seg)?, port))
+}
+
+/// Decode one `{target_host}` path segment into a `Host`.
+///
+/// RFC 9298 §3.1 requires percent-decoding, so an IPv6 literal legitimately
+/// arrives as `2001%3Adb8%3A%3A1`. Chromium *computes* that encoded form but
+/// never sends it — real Chrome puts a bare `2001:db8::1` in the path — so raw
+/// unencoded colons must be accepted too. Bracketed literals are tolerated and
+/// unwrapped before `IpAddr` parsing.
+fn parse_target_host(segment: &str) -> Option<Host> {
+    let decoded = percent_encoding::percent_decode_str(segment)
+        .decode_utf8()
+        .ok()?;
+    let host_str = match decoded.strip_prefix('[') {
+        Some(inner) => inner.strip_suffix(']')?,
+        None => &*decoded,
     };
-    let host = if let Ok(ip) = host_str.parse::<IpAddr>() {
-        Host::Ip(ip)
-    } else {
-        Host::Name(host_str.to_string())
-    };
-    Some((host, port))
+    if host_str.is_empty() {
+        return None;
+    }
+    Some(match host_str.parse::<IpAddr>() {
+        Ok(ip) => Host::Ip(ip),
+        Err(_) => Host::Name(host_str.to_string()),
+    })
 }
 
 async fn send_status<S: quic::SendStream<Bytes>>(
@@ -574,6 +625,15 @@ mod tests {
     use h3::ext::Protocol;
     use http::{HeaderValue, Method, Request, Uri};
 
+    /// Proxy authority used by the tests. Per RFC 9298 it is *our* address, not
+    /// the target's.
+    const PROXY: &str = "https://proxy.example.com:443";
+
+    /// Build a default-template RFC 9298 `:path` for `host`/`port`.
+    fn udp_path(host: &str, port: &str) -> String {
+        format!("{PROXY}/.well-known/masque/udp/{host}/{port}/")
+    }
+
     fn connect_udp_request(uri: &str, with_capsule: bool, auth: Option<&str>) -> Request<()> {
         let mut req = Request::builder()
             .method(Method::CONNECT)
@@ -618,27 +678,136 @@ mod tests {
     }
 
     #[test]
-    fn parse_target_extracts_host_and_port() {
-        let req = connect_udp_request("example.com:8443", true, None);
+    fn parse_target_domain_ipv4_and_ipv6() {
+        // Domain target.
+        let req = connect_udp_request(&udp_path("example.com", "8443"), true, None);
+        let (host, port) = parse_target(&req).expect("parse domain");
+        assert_eq!(host, Host::Name("example.com".to_string()));
+        assert_eq!(port, 8443);
+
+        // IPv4 target.
+        let req4 = connect_udp_request(&udp_path("192.0.2.6", "443"), true, None);
+        let (host, port) = parse_target(&req4).expect("parse v4");
+        assert_eq!(host, Host::Ip("192.0.2.6".parse().unwrap()));
+        assert_eq!(port, 443);
+
+        // IPv6 target, percent-encoded as RFC 9298 §3.1 requires.
+        let req6 = connect_udp_request(&udp_path("2001%3Adb8%3A%3A1", "443"), true, None);
+        let (host, port) = parse_target(&req6).expect("parse encoded v6");
+        assert_eq!(host, Host::Ip("2001:db8::1".parse().unwrap()));
+        assert_eq!(port, 443);
+
+        // IPv6 target with raw colons — Chromium computes the encoded form but
+        // never sends it, so this is what real Chrome actually puts on the wire.
+        let req6raw = connect_udp_request(&udp_path("2001:db8::1", "443"), true, None);
+        let (host, port) = parse_target(&req6raw).expect("parse raw v6");
+        assert_eq!(host, Host::Ip("2001:db8::1".parse().unwrap()));
+        assert_eq!(port, 443);
+
+        // Bracketed IPv6 literal is tolerated too.
+        let req6b = connect_udp_request(&udp_path("[2001:db8::1]", "443"), true, None);
+        let (host, port) = parse_target(&req6b).expect("parse bracketed v6");
+        assert_eq!(host, Host::Ip("2001:db8::1".parse().unwrap()));
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn parse_target_rejects_bad_prefix() {
+        for bad in [
+            "/.well-known/masque/udp",
+            "/.well-known/masque/tcp/example.com/443/",
+            "/masque/udp/example.com/443/",
+            "/.well-known/masque/udpx/example.com/443/",
+            "/",
+            "",
+        ] {
+            let req = connect_udp_request(&format!("{PROXY}{bad}"), true, None);
+            assert!(parse_target(&req).is_none(), "must reject prefix {bad}");
+        }
+    }
+
+    #[test]
+    fn parse_target_rejects_bad_or_missing_port() {
+        // Non-numeric port.
+        let bad = connect_udp_request(&udp_path("example.com", "https"), true, None);
+        assert!(parse_target(&bad).is_none());
+
+        // Out of range for u16.
+        let big = connect_udp_request(&udp_path("example.com", "65536"), true, None);
+        assert!(parse_target(&big).is_none());
+
+        // Missing port segment entirely (path ends after the host).
+        let missing = connect_udp_request(
+            &format!("{PROXY}/.well-known/masque/udp/example.com"),
+            true,
+            None,
+        );
+        assert!(parse_target(&missing).is_none());
+
+        // Empty port segment (host + trailing slash only).
+        let empty = connect_udp_request(
+            &format!("{PROXY}/.well-known/masque/udp/example.com/"),
+            true,
+            None,
+        );
+        assert!(parse_target(&empty).is_none());
+
+        // Missing host segment.
+        let no_host = connect_udp_request(&udp_path("", "443"), true, None);
+        assert!(parse_target(&no_host).is_none());
+    }
+
+    #[test]
+    fn parse_target_tolerates_trailing_slash_variants() {
+        // Trailing slash present (the canonical template expansion) ...
+        let with = connect_udp_request(
+            &format!("{PROXY}/.well-known/masque/udp/example.com/8443/"),
+            true,
+            None,
+        );
+        assert_eq!(
+            parse_target(&with).expect("parse with trailing slash"),
+            (Host::Name("example.com".to_string()), 8443u16)
+        );
+
+        // ... and absent (some clients omit it).
+        let without = connect_udp_request(
+            &format!("{PROXY}/.well-known/masque/udp/example.com/8443"),
+            true,
+            None,
+        );
+        assert_eq!(
+            parse_target(&without).expect("parse without trailing slash"),
+            (Host::Name("example.com".to_string()), 8443u16)
+        );
+    }
+
+    #[test]
+    fn parse_target_ignores_authority() {
+        // `:authority` is the *proxy's* identity (RFC 9298 §3.4), so a request
+        // whose authority happens to look like a valid host:port must still
+        // resolve to the target named by the path — not to the authority.
+        let req = connect_udp_request(
+            "https://192.0.2.6:443/.well-known/masque/udp/example.com/8443/",
+            true,
+            None,
+        );
         let (host, port) = parse_target(&req).expect("parse");
         assert_eq!(host, Host::Name("example.com".to_string()));
         assert_eq!(port, 8443);
 
-        let req6 = connect_udp_request("[2001:db8::1]:443", true, None);
-        let (host, port) = parse_target(&req6).expect("parse v6");
-        assert_eq!(host, Host::Ip("2001:db8::1".parse().unwrap()));
-        assert_eq!(port, 443);
-
-        // No explicit port -> rejected.
-        let no_port = connect_udp_request("example.com", true, None);
-        assert!(parse_target(&no_port).is_none());
+        // And the obsolete draft-00 form (target in `:authority`, no path) is
+        // rejected outright rather than tunnelling to the proxy itself.
+        let legacy = connect_udp_request("https://example.com:8443/", true, None);
+        assert!(parse_target(&legacy).is_none());
     }
 
     #[test]
     fn auth_header_accepts_bearer_and_basic() {
         let token = "s3cr3t";
+        let uri = udp_path("example.com", "443");
         // Bearer
-        let req = connect_udp_request("example.com:443", true, Some("Bearer s3cr3t"));
+        let req = connect_udp_request(&uri, true, Some("Bearer s3cr3t"));
         assert!(check_proxy_auth(req.headers(), Some(token)));
 
         // Basic user:token
@@ -646,7 +815,7 @@ mod tests {
             "Basic {}",
             base64::engine::general_purpose::STANDARD.encode("user:s3cr3t")
         );
-        let req = connect_udp_request("example.com:443", true, Some(&basic));
+        let req = connect_udp_request(&uri, true, Some(&basic));
         assert!(check_proxy_auth(req.headers(), Some(token)));
 
         // Basic with just the token as credential
@@ -654,15 +823,16 @@ mod tests {
             "Basic {}",
             base64::engine::general_purpose::STANDARD.encode("s3cr3t")
         );
-        let req = connect_udp_request("example.com:443", true, Some(&basic2));
+        let req = connect_udp_request(&uri, true, Some(&basic2));
         assert!(check_proxy_auth(req.headers(), Some(token)));
     }
 
     #[test]
     fn auth_header_rejects_wrong_or_missing() {
         let token = "s3cr3t";
+        let uri = udp_path("example.com", "443");
         // Wrong bearer
-        let req = connect_udp_request("example.com:443", true, Some("Bearer wrong"));
+        let req = connect_udp_request(&uri, true, Some("Bearer wrong"));
         assert!(!check_proxy_auth(req.headers(), Some(token)));
 
         // Basic with wrong password
@@ -670,29 +840,30 @@ mod tests {
             "Basic {}",
             base64::engine::general_purpose::STANDARD.encode("user:nope")
         );
-        let req = connect_udp_request("example.com:443", true, Some(&basic));
+        let req = connect_udp_request(&uri, true, Some(&basic));
         assert!(!check_proxy_auth(req.headers(), Some(token)));
 
         // Missing header
-        let req = connect_udp_request("example.com:443", true, None);
+        let req = connect_udp_request(&uri, true, None);
         assert!(!check_proxy_auth(req.headers(), Some(token)));
 
         // No token configured at all
-        let req = connect_udp_request("example.com:443", true, Some("Bearer x"));
+        let req = connect_udp_request(&uri, true, Some("Bearer x"));
         assert!(!check_proxy_auth(req.headers(), None));
     }
 
     #[test]
     fn validate_connect_udp_accepts_and_rejects() {
         let token = "s3cr3t";
+        let uri = udp_path("example.com", "443");
         // Happy path
-        let req = connect_udp_request("example.com:443", true, Some("Bearer s3cr3t"));
+        let req = connect_udp_request(&uri, true, Some("Bearer s3cr3t"));
         let (host, port) = validate_connect_udp(&req, Some(token)).expect("ok");
         assert_eq!(host, Host::Name("example.com".to_string()));
         assert_eq!(port, 443);
 
         // Wrong method
-        let mut bad = connect_udp_request("example.com:443", true, Some("Bearer s3cr3t"));
+        let mut bad = connect_udp_request(&uri, true, Some("Bearer s3cr3t"));
         *bad.method_mut() = Method::GET;
         assert_eq!(
             validate_connect_udp(&bad, Some(token)).unwrap_err(),
@@ -700,21 +871,28 @@ mod tests {
         );
 
         // Missing capsule-protocol
-        let no_cap = connect_udp_request("example.com:443", false, Some("Bearer s3cr3t"));
+        let no_cap = connect_udp_request(&uri, false, Some("Bearer s3cr3t"));
         assert_eq!(
             validate_connect_udp(&no_cap, Some(token)).unwrap_err(),
             http::StatusCode::BAD_REQUEST
         );
 
+        // Malformed target path -> 400
+        let bad_target = connect_udp_request(&udp_path("example.com", "http"), true, Some("Bearer s3cr3t"));
+        assert_eq!(
+            validate_connect_udp(&bad_target, Some(token)).unwrap_err(),
+            http::StatusCode::BAD_REQUEST
+        );
+
         // Missing auth
-        let no_auth = connect_udp_request("example.com:443", true, None);
+        let no_auth = connect_udp_request(&uri, true, None);
         assert_eq!(
             validate_connect_udp(&no_auth, Some(token)).unwrap_err(),
             http::StatusCode::PROXY_AUTHENTICATION_REQUIRED
         );
 
         // Not extended-connect (no :protocol)
-        let mut no_proto = connect_udp_request("example.com:443", true, Some("Bearer s3cr3t"));
+        let mut no_proto = connect_udp_request(&uri, true, Some("Bearer s3cr3t"));
         no_proto.extensions_mut().clear();
         assert_eq!(
             validate_connect_udp(&no_proto, Some(token)).unwrap_err(),
@@ -864,7 +1042,7 @@ mod e2e {
             let _ = server.run().await;
         });
 
-        // Local UDP echo socket — the single :authority target for the tunnel.
+        // Local UDP echo socket — the single target for the tunnel.
         let echo = UdpSocket::bind("127.0.0.1:0").await?;
         let echo_addr = echo.local_addr()?;
         tokio::spawn(async move {
@@ -935,10 +1113,15 @@ mod e2e {
         let (h3_conn, mut send_request) =
             builder.build(h3_quinn_conn).await.map_err(|e| anyhow!("h3 client: {e}"))?;
 
-        // CONNECT-UDP to the echo socket.
+        // CONNECT-UDP to the echo socket, in the RFC 9298 §3.4 form:
+        // `:authority` is the *proxy* (localhost:udp_port) and the target lives
+        // in `:path` per the default URI template.
         let mut req = Request::builder()
             .method(Method::CONNECT)
-            .uri(format!("https://127.0.0.1:{}/", echo_addr.port()))
+            .uri(format!(
+                "https://localhost:{udp_port}/.well-known/masque/udp/127.0.0.1/{}/",
+                echo_addr.port()
+            ))
             .body(())
             .expect("valid CONNECT-UDP request");
         req.headers_mut()

@@ -21,7 +21,7 @@ use crate::config::AppConfig;
 /// Returns `true` if `ip` belongs to an RFC 6890 IPv4/IPv6 special-purpose
 /// address range. These addresses must never be proxied to, whether the
 /// target was supplied directly or resolved from a domain name.
-fn is_rfc6890_special(ip: IpAddr) -> bool {
+pub(crate) fn is_rfc6890_special(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => is_rfc6890_special_v4(ipv4),
         IpAddr::V6(ipv6) => is_rfc6890_special_v6(ipv6),
@@ -69,7 +69,7 @@ fn is_rfc6890_special_v6(ip: Ipv6Addr) -> bool {
 const HTTP_HEADER_MAX_LEN: usize = 8192;
 const SOCKS4_FIELD_MAX_LEN: usize = 1024;
 const PROBE_LEN: usize = 512;
-const UDP_PACKET_MAX_LEN: usize = 65535;
+pub(crate) const UDP_PACKET_MAX_LEN: usize = 65535;
 
 #[derive(Debug, Clone)]
 pub struct ProxyServer {
@@ -109,12 +109,12 @@ impl ProxyServer {
 }
 
 #[derive(Debug, Clone)]
-struct Resolver {
+pub(crate) struct Resolver {
     inner: TokioAsyncResolver,
 }
 
 impl Resolver {
-    fn new(dns_server: Option<SocketAddr>) -> anyhow::Result<Self> {
+    pub(crate) fn new(dns_server: Option<SocketAddr>) -> anyhow::Result<Self> {
         let inner = match dns_server {
             Some(server) => {
                 let nameservers =
@@ -157,13 +157,13 @@ enum Protocol {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Host {
+pub(crate) enum Host {
     Ip(IpAddr),
     Name(String),
 }
 
 impl Host {
-    async fn resolve(&self, resolver: &Resolver, port: u16) -> anyhow::Result<SocketAddr> {
+    pub(crate) async fn resolve(&self, resolver: &Resolver, port: u16) -> anyhow::Result<SocketAddr> {
         match self {
             Host::Ip(ip) => Ok(SocketAddr::new(*ip, port)),
             Host::Name(name) => resolver.resolve_first(name, port).await,
@@ -185,6 +185,42 @@ fn format_target(peer_addr: SocketAddr, destination: Option<(&Host, u16)>) -> St
         Some((Host::Ip(IpAddr::V6(ip)), port)) => format!("<{peer_addr},[{ip}]:{port}>"),
         Some((host, port)) => format!("<{peer_addr},{host}:{port}>"),
         None => format!("<{peer_addr},None>"),
+    }
+}
+
+/// Emit the per-traffic-transaction flow log. The whole line is a single
+/// standard-format log entry whose `message` is one line of JSON recording the
+/// flow: where it came from, where it went, and what protocol/transport carried
+/// it. Keeping the JSON in the *message* (not the global formatter) means the
+/// rest of the logs stay in the cheap human-readable format while every proxied
+/// request is still machine-parseable.
+///
+/// JSON schema:
+///   source_ip / source_port  - client socket address
+///   target_host / target_port - requested destination (domain or literal IP)
+///   tcpOrUdp                 - transport the request used ("tcp" or "udp")
+///   ResolvedAddress          - concrete upstream address after DNS resolution
+///   httpOrSocks              - proxy protocol that carried the request
+pub(crate) fn log_request(
+    source: SocketAddr,
+    host: &Host,
+    port: u16,
+    transport: &str,
+    resolved: SocketAddr,
+    proxy: &str,
+) {
+    let message = serde_json::json!({
+        "source_ip": source.ip().to_string(),
+        "source_port": source.port(),
+        "target_host": host.to_string(),
+        "target_port": port,
+        "tcpOrUdp": transport,
+        "ResolvedAddress": resolved.to_string(),
+        "httpOrSocks": proxy,
+    });
+    match serde_json::to_string(&message) {
+        Ok(line) => info!("{}", line),
+        Err(_) => info!(target = %format_target(source, Some((host, port))), "request target"),
     }
 }
 
@@ -280,14 +316,10 @@ async fn handle_socks5(
             return Err(err);
         }
     };
-    info!(
-        target = %format_target(peer_addr, Some((&host, port))),
-        "request target"
-    );
 
     match cmd {
-        0x01 => handle_socks5_connect(client, resolver, config, host, port).await,
-        0x02 => handle_socks5_bind(client, resolver, config, host, port).await,
+        0x01 => handle_socks5_connect(client, peer_addr, resolver, config, host, port).await,
+        0x02 => handle_socks5_bind(client, peer_addr, resolver, config, host, port).await,
         0x03 => handle_socks5_udp_associate(client, peer_addr, resolver, config, host, port).await,
         _ => {
             send_socks5_reply(
@@ -303,12 +335,14 @@ async fn handle_socks5(
 
 async fn handle_socks5_bind(
     mut client: TcpStream,
+    peer_addr: SocketAddr,
     resolver: Resolver,
     config: &AppConfig,
     host: Host,
     port: u16,
 ) -> anyhow::Result<()> {
     let expected_peer = host.resolve(&resolver, port).await?;
+    log_request(peer_addr, &host, port, "tcp", expected_peer, "socks5");
     if config.block_special_addrs() && is_rfc6890_special(expected_peer.ip()) {
         send_socks5_reply(
             &mut client,
@@ -354,12 +388,14 @@ async fn handle_socks5_bind(
 
 async fn handle_socks5_connect(
     mut client: TcpStream,
+    peer_addr: SocketAddr,
     resolver: Resolver,
     config: &AppConfig,
     host: Host,
     port: u16,
 ) -> anyhow::Result<()> {
     let target_addr = host.resolve(&resolver, port).await?;
+    log_request(peer_addr, &host, port, "tcp", target_addr, "socks5");
     if config.block_special_addrs() && is_rfc6890_special(target_addr.ip()) {
         send_socks5_reply(
             &mut client,
@@ -475,6 +511,7 @@ async fn handle_socks5_udp_associate(
                                         continue;
                                     }
                                 };
+                                log_request(peer_addr, &host, port, "udp", t, "socks5");
                                 if config.block_special_addrs() && is_rfc6890_special(t.ip()) {
                                     debug!(target = %t, "SOCKS5 UDP relay blocked target IP: special-purpose (RFC 6890) address");
                                     continue;
@@ -669,12 +706,9 @@ async fn handle_socks4(
     } else {
         Host::Ip(IpAddr::V4(Ipv4Addr::from(ip)))
     };
-    info!(
-        target = %format_target(peer_addr, Some((&host, port))),
-        "request target"
-    );
 
     let target_addr = host.resolve(&resolver, port).await?;
+    log_request(peer_addr, &host, port, "tcp", target_addr, "socks4");
     if config.block_special_addrs() && is_rfc6890_special(target_addr.ip()) {
         send_socks4_reply(&mut client, 0x5B).await?; // request rejected
         bail!("SOCKS4 connection blocked: target IP {} is a special-purpose (RFC 6890) address", target_addr.ip());
@@ -743,11 +777,8 @@ async fn handle_http_connect(
     }
 
     let (host, port) = parse_authority(authority)?;
-    info!(
-        target = %format_target(peer_addr, Some((&host, port))),
-        "request target"
-    );
     let target_addr = host.resolve(&resolver, port).await?;
+    log_request(peer_addr, &host, port, "tcp", target_addr, "http");
     if config.block_special_addrs() && is_rfc6890_special(target_addr.ip()) {
         client
             .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")

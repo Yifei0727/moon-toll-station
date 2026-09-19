@@ -88,6 +88,48 @@ pub struct AppConfig {
         help = "Prohibit proxying traffic to RFC 6890 special-purpose addresses (private, loopback, link-local, CGNAT, multicast, reserved, documentation, etc.). Equivalent to --no-loopback."
     )]
     pub acl_no_rfc6890: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Enable an additional protocol mode alongside the TCP SOCKS/HTTP proxy. Currently only 'h3' (HTTP/3 MASQUE CONNECT-UDP) is supported. Requires --key, --cert-chain, and --auth-token."
+    )]
+    pub enable: Option<EnableProtocol>,
+
+    #[arg(
+        long,
+        required_if_eq("enable", "h3"),
+        help = "PEM private key file for the HTTP/3 (QUIC) listener. Required when --enable h3."
+    )]
+    pub key: Option<String>,
+
+    #[arg(
+        long,
+        required_if_eq("enable", "h3"),
+        help = "PEM certificate chain (fullchain) file for the HTTP/3 (QUIC) listener. Required when --enable h3."
+    )]
+    pub cert_chain: Option<String>,
+
+    #[arg(
+        long,
+        required_if_eq("enable", "h3"),
+        help = "Shared secret required on every CONNECT-UDP request (Proxy-Authorization). Required when --enable h3, since UDP/443 is a publicly reachable open-proxy port."
+    )]
+    pub auth_token: Option<String>,
+
+    #[arg(
+        long,
+        default_value_t = 443,
+        help = "UDP port for the QUIC/HTTP/3 MASQUE listener. Bound to --listen's IP. Default 443."
+    )]
+    pub udp_port: u16,
+}
+
+/// Protocol modes selectable via `--enable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum EnableProtocol {
+    /// HTTP/3 MASQUE (RFC 9298 CONNECT-UDP) over QUIC.
+    H3,
 }
 
 impl AppConfig {

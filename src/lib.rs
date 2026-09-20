@@ -1,8 +1,10 @@
+pub mod capsule;
 pub mod config;
 pub mod logging;
 pub mod masque;
 pub mod server;
 pub mod service;
+pub mod tun;
 pub mod upgrade;
 
 pub use config::{AppConfig, Cli, Command, DisableProtocol, EnableProtocol};

@@ -37,6 +37,22 @@ percent-encoding = "2"
 # Decoding the Proxy-Authorization: Basic challenge for CONNECT-UDP.
 base64 = "0.22"
 
+# Parsing the `--ip-pool` CIDR for CONNECT-IP address allocation.
+ipnet = "2"
+
+# Raw `TUNSETIFF` ioctl for the CONNECT-IP layer-3 `tun` device. Already a
+# transitive dependency of the QUIC stack; listed explicitly because we use it
+# directly. musl-safe (raw ioctls are arch-independent on Linux).
+libc = "0.2"
+
+# Local patch: accept arbitrary extended-CONNECT `:protocol` values
+# (`connect-ip`, `websocket`, ...) in h3 0.0.8. Upstream `Protocol::from_str`
+# only accepts `webtransport`/`connect-udp` and rejects everything else with
+# H3_MESSAGE_ERROR. See `vendor/h3-patched/src/ext.rs`. NOT shippable as-is —
+# a release must host this on a fork repo and switch to `git = "..."`.
+[patch.crates-io]
+h3 = { path = "vendor/h3-patched" }
+
 [profile.release]
 strip = true
 lto = "fat"

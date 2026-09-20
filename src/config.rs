@@ -127,6 +127,13 @@ pub struct AppConfig {
 
     #[arg(
         long,
+        default_value = "198.18.0.0/15",
+        help = "CIDR pool CONNECT-IP assigns client addresses from (RFC 9484 VPN gateway). One /30 is taken per session for IPv4 pools; one /64 for IPv6. Default 198.18.0.0/15 (RFC 2544 benchmarking range, globally non-routed — suitable as a private VPN pool). Requires root (CAP_NET_ADMIN) at runtime."
+    )]
+    pub ip_pool: String,
+
+    #[arg(
+        long,
         value_enum,
         help = "Disable a protocol mode. Currently only 'http', which disables the TCP listener on --listen that serves SOCKS4, SOCKS5 and HTTP CONNECT together (it is NOT an HTTP-only toggle: all three go away). Requires --enable h3, otherwise nothing would be listening."
     )]

@@ -839,7 +839,14 @@ fn find_subsequence(data: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn parse_authority(authority: &str) -> anyhow::Result<(Host, u16)> {
+/// Parse an HTTP `CONNECT` authority (`host:port`) into a [`Host`] + port.
+///
+/// An explicit port is required (RFC 9114 CONNECT); a missing `:` delimiter is
+/// rejected. Bracketed IPv6 literals (`[::1]:443`) are unwrapped; bare
+/// `host:port`, IPv4, and domain names are all accepted. Shared by the TCP
+/// `handle_http_connect` and the HTTP/3 MASQUE plain-TCP-CONNECT tunnel (which
+/// reads the target from the request's `:authority`).
+pub(crate) fn parse_authority(authority: &str) -> anyhow::Result<(Host, u16)> {
     if authority.is_empty() {
         bail!("empty CONNECT authority");
     }

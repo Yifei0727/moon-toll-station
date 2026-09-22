@@ -172,14 +172,16 @@ impl MasqueServer {
         let ip_pool = Arc::new(StdMutex::new(IpPool::new(&self.config.ip_pool)?));
 
         while let Some(incoming) = endpoint.accept().await {
+            // Available before the handshake completes, so a failed handshake
+            // can still be attributed to a source.
+            let peer = incoming.remote_address();
             let conn = match incoming.await {
                 Ok(c) => c,
                 Err(e) => {
-                    warn!(error = %e, "QUIC handshake failed");
+                    warn!(peer = %peer, error = %e, "QUIC handshake failed");
                     continue;
                 }
             };
-            let peer = conn.remote_address();
             // Clone the raw quinn connection so the per-stream tunnel task can
             // query the live datagram MTU without borrowing the h3 connection.
             let quinn_conn = conn.clone();

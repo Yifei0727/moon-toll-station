@@ -120,10 +120,10 @@ pub struct AppConfig {
 
     #[arg(
         long,
-        default_value_t = 443,
-        help = "UDP port for the QUIC/HTTP/3 MASQUE listener. Bound to --listen's IP. Default 443."
+        default_value = "0.0.0.0:443",
+        help = "HTTP/3 MASQUE (QUIC) listener bind address, independent of --listen. Default 0.0.0.0:443."
     )]
-    pub udp_port: u16,
+    pub h3_bind: SocketAddr,
 
     #[arg(
         long,

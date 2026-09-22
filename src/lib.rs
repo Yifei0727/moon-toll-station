@@ -4,6 +4,10 @@ pub mod logging;
 pub mod masque;
 pub mod server;
 pub mod service;
+// CONNECT-IP (tun/NAT) is Linux-only: it uses the Linux TUNSETIFF ioctl and
+// `libc::Ioctl` (defined only on linux_like targets). Windows/macOS builds
+// compile and serve the other protocols; see `masque::handle_connection`.
+#[cfg(target_os = "linux")]
 pub mod tun;
 pub mod upgrade;
 

@@ -4,9 +4,11 @@
 //! request types, all dispatched from the same listener:
 //!
 //! 1. **`CONNECT-UDP`** (RFC 9298) — UDP payloads carried as HTTP/3 DATAGRAMs
-//!    (RFC 9297) whose body is a `DATAGRAM` capsule (RFC 9297 §4 / RFC 9298 §4).
-//! 2. **`CONNECT-IP`** (RFC 9484) — IP packets carried as HTTP/3 DATAGRAM `IP`
-//!    capsules; a real layer-3 VPN gateway (needs root).
+//!    (RFC 9297): `Context ID 0` + the raw UDP payload.
+//! 2. **`CONNECT-IP`** (RFC 9484) — IP packets carried as HTTP/3 DATAGRAMs:
+//!    `Context ID 0` + the raw IP packet; a real layer-3 VPN gateway (needs
+//!    root). Signalling capsules (`ADDRESS_ASSIGN` / `ADDRESS_REQUEST` /
+//!    `ROUTE_ADVERTISEMENT`) travel on the request stream as RFC 9297 capsules.
 //! 3. **Plain TCP `CONNECT`** (RFC 9114 §4.4, an extended CONNECT with *no*
 //!    `:protocol`) — a pure byte pipe to the request's `:authority` target. No
 //!    capsules, no DATAGRAMs, no tun; exactly like an HTTP/1.1 `CONNECT` but over
@@ -29,19 +31,30 @@
 //!   by QUIC stream id, while each accepted `CONNECT-UDP` request gets its own
 //!   `DatagramSender` and runs in its own task. => multiple concurrent
 //!   `CONNECT-UDP` streams per QUIC connection (Chrome multiplexes) are supported.
-//! * The h3-datagram layer automatically prepends/strips the Quarter Stream ID
-//!   (stream id / 4) to the wire datagram, so the bytes we hand to / receive from
-//!   it are exactly the RFC 9297 capsule (`Type=0x00` + `Length` + `Value`).
+//! * The h3-datagram layer handles ONLY the Quarter Stream ID (stream id / 4):
+//!   it prepends/strips it to/from the wire datagram. The Context ID is
+//!   entirely ours: we write a Context ID varint of 0 (a single `0x00` byte)
+//!   followed by the raw UDP payload / IP packet, and parse (and require)
+//!   Context ID 0 on receive, dropping datagrams with any other Context ID
+//!   silently (RFC 9297 §4, RFC 9298 §4.2, RFC 9484 §4.2). RFC 9297 capsule
+//!   TLV framing is used only on the request stream (CONNECT-IP signalling),
+//!   never in datagrams.
 
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::{Arc, Mutex as StdMutex},
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
 };
+// Only used by the Linux-only CONNECT-IP helpers below.
+#[cfg(target_os = "linux")]
+use std::net::{Ipv4Addr, Ipv6Addr};
+// Only needed for the CONNECT-IP address pool (Linux-only data plane).
+#[cfg(target_os = "linux")]
+use std::sync::Mutex as StdMutex;
 
 use anyhow::Context;
 use base64::Engine;
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use h3::{
     ext::Protocol,
@@ -62,10 +75,15 @@ use tokio::{
     sync::{mpsc, Mutex},
     time::timeout,
 };
+// CONNECT-IP teardown signalling (Linux-only data plane).
+#[cfg(target_os = "linux")]
+use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
 use crate::capsule;
 use crate::config::AppConfig;
+// CONNECT-IP (tun/NAT) is Linux-only; see `lib.rs`.
+#[cfg(target_os = "linux")]
 use crate::tun::{IpPool, TunDevice};
 use crate::server::{
     Host, Resolver, UDP_PACKET_MAX_LEN, is_rfc6890_special, log_request, parse_authority,
@@ -81,15 +99,16 @@ type H3Sender = DatagramSender<SendDatagramHandler, Bytes>;
 type H3Reader = DatagramReader<RecvDatagramHandler>;
 
 /// Per-stream channel used by the reader task to hand demultiplexed
-/// (QSID-stripped) datagram capsules to the owning tunnel task.
+/// (QSID-stripped) datagram payloads to the owning tunnel task.
 type Rx = mpsc::UnboundedReceiver<Bytes>;
 
 /// Routing table: QUIC stream id -> tunnel task inbox.
 type Routes = Arc<Mutex<HashMap<StreamId, mpsc::UnboundedSender<Bytes>>>>;
 
 /// Headroom (bytes) we budget for the QUIC DATAGRAM frame header, the
-/// Quarter Stream ID varint, and the capsule's `Type`/`Length` varints when
-/// deciding whether an outgoing capsule fits the current datagram MTU.
+/// Quarter Stream ID varint (added by h3-datagram), and the Context ID varint
+/// we prepend ourselves, when deciding whether an outgoing datagram fits the
+/// current datagram MTU.
 const DATAGRAM_OVERHEAD: usize = 8;
 
 /// Fixed prefix of the default (IANA-registered) `CONNECT-UDP` URI template,
@@ -156,8 +175,9 @@ impl MasqueServer {
         tp.datagram_send_buffer_size(64 * 1024);
         server_cfg.transport_config(Arc::new(tp));
 
-        // Reuse --listen's IP; only the UDP port differs (default 443).
-        let addr = SocketAddr::new(self.config.listen.ip(), self.config.udp_port);
+        // Bind the QUIC endpoint to --h3-bind directly; independent of --listen
+        // (which is purely the TCP proxy's bind address).
+        let addr = self.config.h3_bind;
         let endpoint = Endpoint::server(server_cfg, addr)
             .with_context(|| format!("failed to bind MASQUE/QUIC endpoint on {addr}"))?;
 
@@ -168,8 +188,12 @@ impl MasqueServer {
 
         // One CONNECT-IP address pool, shared across all sessions/connections so
         // allocations never collide. Validate it now (cheap) so a bad `--ip-pool`
-        // fails fast at startup rather than on the first tunnel.
+        // fails fast at startup rather than on the first tunnel. Linux-only:
+        // CONNECT-IP's tun/NAT data plane does not exist elsewhere.
+        #[cfg(target_os = "linux")]
         let ip_pool = Arc::new(StdMutex::new(IpPool::new(&self.config.ip_pool)?));
+        #[cfg(not(target_os = "linux"))]
+        let ip_pool = ();
 
         while let Some(incoming) = endpoint.accept().await {
             // Available before the handshake completes, so a failed handshake
@@ -222,13 +246,16 @@ async fn handle_connection(
     quinn_conn: QuinnConnection,
     resolver: Resolver,
     config: AppConfig,
-    pool: Arc<StdMutex<IpPool>>,
+    // CONNECT-IP address pool; unused off-Linux (connect-ip is answered 501).
+    #[cfg(target_os = "linux")] pool: Arc<StdMutex<IpPool>>,
+    #[cfg(not(target_os = "linux"))] _pool: (),
 ) -> anyhow::Result<()> {
     let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
 
     // One reader for the whole connection. It owns its own quinn::Connection
     // clone, so it does not borrow `h3_conn`. It demultiplexes incoming
-    // capsules to the right tunnel task by QUIC stream id.
+    // datagrams (Quarter Stream ID already stripped by h3-datagram; Context ID
+    // still present) to the right tunnel task by QUIC stream id.
     let mut reader: H3Reader = h3_conn.get_datagram_reader();
     let reader_routes = routes.clone();
     tokio::spawn(async move {
@@ -239,10 +266,12 @@ async fn handle_connection(
                     let capsule = dgram.into_payload();
                     let mut guard = reader_routes.lock().await;
                     match guard.get(&sid) {
-                        Some(tx) => {
-                            // The tunnel task owns the UDP socket; just forward
-                            // the capsule (QSID already stripped by h3-datagram).
-                            if tx.send(capsule).is_err() {
+                    Some(tx) => {
+                        // The tunnel task owns the UDP socket / tun device;
+                        // just forward the raw datagram payload (QSID already
+                        // stripped by h3-datagram; the tunnel parses the
+                        // Context ID itself).
+                        if tx.send(capsule).is_err() {
                                 debug!(stream = %sid, "tunnel task gone; dropping datagram");
                                 guard.remove(&sid);
                             }
@@ -326,32 +355,48 @@ async fn handle_connection(
             // CONNECT-IP (RFC 9484). With the patched h3, a real client sends
             // `:protocol = connect-ip`; we also still accept the legacy
             // path-only form (no `:protocol`) on the RFC 9484 default path.
-            let sender: H3Sender = h3_conn.get_datagram_sender(stream_id);
-            let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
-            routes.lock().await.insert(stream_id, tx);
+            // The tun/NAT data plane is Linux-only; on other platforms the
+            // request fails cleanly (501) and the other protocols are served.
+            #[cfg(target_os = "linux")]
+            {
+                let sender: H3Sender = h3_conn.get_datagram_sender(stream_id);
+                let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+                routes.lock().await.insert(stream_id, tx);
 
-            let config = config.clone();
-            let quinn_conn = quinn_conn.clone();
-            let routes = routes.clone();
-            let pool = pool.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_ip_stream(
-                    req,
-                    req_stream,
-                    sender,
-                    rx,
-                    config,
-                    peer,
-                    stream_id,
-                    quinn_conn,
-                    pool,
-                )
-                .await
-                {
-                    debug!(peer = %peer, stream = %stream_id, error = %e, "CONNECT-IP tunnel ended");
-                }
-                routes.lock().await.remove(&stream_id);
-            });
+                let config = config.clone();
+                let quinn_conn = quinn_conn.clone();
+                let routes = routes.clone();
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_ip_stream(
+                        req,
+                        req_stream,
+                        sender,
+                        rx,
+                        config,
+                        peer,
+                        stream_id,
+                        quinn_conn,
+                        pool,
+                    )
+                    .await
+                    {
+                        debug!(peer = %peer, stream = %stream_id, error = %e, "CONNECT-IP tunnel ended");
+                    }
+                    routes.lock().await.remove(&stream_id);
+                });
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                warn!(
+                    peer = %peer,
+                    stream = %stream_id,
+                    "CONNECT-IP requires Linux (no tun/NAT data plane on this platform) -> 501"
+                );
+                tokio::spawn(async move {
+                    let _ = send_status(&mut req_stream, StatusCode::NOT_IMPLEMENTED).await;
+                });
+            }
         } else if proto_str == Some("websocket") {
             // RFC 9220 (WebSocket over HTTP/3): extended CONNECT with
             // `:protocol = websocket`. After a `200`, the stream carries the
@@ -421,7 +466,8 @@ async fn handle_connection(
 }
 
 /// Tunnel one `CONNECT-UDP` request: validate, resolve target once, then relay
-/// UDP packets <-> HTTP/3 DATAGRAM capsules for the lifetime of the stream.
+/// UDP packets <-> HTTP/3 DATAGRAMs (Context ID 0 + raw UDP payload) for the
+/// lifetime of the stream.
 #[allow(clippy::too_many_arguments)]
 async fn handle_stream<S>(
     req: Request<()>,
@@ -487,8 +533,8 @@ where
     let mut buf = vec![0u8; UDP_PACKET_MAX_LEN];
     loop {
         tokio::select! {
-            // Downlink: target -> client (wrap in a DATAGRAM capsule, send via
-            // HTTP/3 DATAGRAM). h3-datagram adds the Quarter Stream ID.
+            // Downlink: target -> client (Context ID 0 + raw UDP payload, sent
+            // via HTTP/3 DATAGRAM; h3-datagram adds the Quarter Stream ID).
             read = udp.recv_from(&mut buf) => {
                 let (n, _from) = match read {
                     Ok(v) => v,
@@ -497,7 +543,12 @@ where
                         break;
                     }
                 };
-                let capsule = encode_capsule(&buf[..n]);
+                // RFC 9298 §4.2: HTTP Datagram payload = Context ID (varint) +
+                // UDP Proxying Payload. Context ID 0 is a single 0x00 byte.
+                let mut dgram = BytesMut::with_capacity(1 + n);
+                dgram.put_u8(0x00);
+                dgram.extend_from_slice(&buf[..n]);
+                let dgram = dgram.freeze();
 
                 // QUIC datagrams are MTU-bounded (~1200 B initially). A UDP
                 // packet that won't fit is dropped; RFC 9298 relies on the
@@ -505,7 +556,7 @@ where
                 // variants are private in 0.0.2, so we pre-check the MTU
                 // instead of matching TooLarge at runtime.)
                 let too_big = match quinn_conn.max_datagram_size() {
-                    Some(max) => capsule.len() + DATAGRAM_OVERHEAD > max,
+                    Some(max) => dgram.len() + DATAGRAM_OVERHEAD > max,
                     None => true,
                 };
                 if too_big {
@@ -517,22 +568,25 @@ where
                     continue;
                 }
 
-                if let Err(e) = sender.send_datagram(capsule) {
+                if let Err(e) = sender.send_datagram(dgram) {
                     debug!(peer = %peer, error = %e, "datagram send error; ending tunnel");
                     break;
                 }
             }
-            // Uplink: client -> target. Reader handed us the capsule; extract the
-            // raw UDP payload and write it to the upstream socket.
+            // Uplink: client -> target. Reader handed us the datagram payload
+            // (QSID already stripped); parse the Context ID and require 0 —
+            // the remainder is then the raw UDP payload.
             got = rx.recv() => {
                 match got {
-                    Some(capsule) => match decode_capsule(&capsule) {
+                    Some(dgram) => match capsule::strip_context_id(&dgram) {
                         Some(payload) => {
-                            if let Err(e) = udp.send(&payload).await {
+                            if let Err(e) = udp.send(payload).await {
                                 debug!(peer = %peer, target = %target, error = %e, "tunnel UDP send failed");
                             }
                         }
-                        None => debug!(peer = %peer, stream = %stream_id, "malformed capsule dropped"),
+                        // Non-zero/truncated Context ID: drop silently, keep
+                        // the tunnel up (RFC 9298 §4.2).
+                        None => debug!(peer = %peer, stream = %stream_id, "datagram with non-zero or truncated Context ID dropped"),
                     },
                     None => break, // reader task gone / connection closed
                 }
@@ -549,12 +603,16 @@ where
 ///
 /// After the `200` + `capsule-protocol` response, this allocates the client an
 /// address from the shared pool, creates a `tun` device (proxy side = one end of
-/// a PtP link, client = the peer), NATs the client's traffic, tells the client
-/// its address (`Address Assign`) and the routes we advertise (`Route
-/// Advertisement`, default `0.0.0.0/0` / `::/0`), and then relays IP packets
-/// between the `tun` device and HTTP/3 DATAGRAM `IP` capsules for the life of
-/// the stream. On teardown, dropping `tun` removes the interface, the iptables
-/// rules, and restores `ip_forward`.
+/// a PtP link, client = the peer), NATs the client's traffic, and then relays
+/// IP packets between the `tun` device and HTTP/3 DATAGRAMs (Context ID 0 +
+/// raw packet) for the life of the stream. Signalling is on the request
+/// stream: the proxy sends `ADDRESS_ASSIGN` (assigned client address/prefix)
+/// and `ROUTE_ADVERTISEMENT` (default route) as RFC 9297 capsules via
+/// `send_data`, and a stream-reader task decodes client capsules
+/// (`ADDRESS_REQUEST` is answered with a matching `ADDRESS_ASSIGN`).
+/// On teardown, dropping `tun` removes the interface, the iptables rules, and
+/// restores `ip_forward`.
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn handle_ip_stream<S>(
     req: Request<()>,
@@ -568,7 +626,11 @@ async fn handle_ip_stream<S>(
     pool: Arc<StdMutex<IpPool>>,
 ) -> anyhow::Result<()>
 where
-    S: quic::SendStream<Bytes> + quic::RecvStream,
+    S: quic::SendStream<Bytes> + quic::RecvStream + quic::BidiStream<Bytes>,
+    // The request stream is split and its halves move into the spawned
+    // capsule-reader task, so the associated stream types must be `Send`.
+    <S as quic::BidiStream<Bytes>>::SendStream: Send + 'static,
+    <S as quic::BidiStream<Bytes>>::RecvStream: Send + 'static,
 {
     let token = config.auth_token.as_deref();
 
@@ -626,38 +688,138 @@ where
         .expect("valid 200 response");
     req_stream.send_response(resp).await?;
 
-    // Tell the client the address/prefix it owns.
-    let assign = capsule::encode_address_assign(&[capsule::IpAddressEntry {
+    // Signalling capsules travel on the CONNECT request stream (RFC 9297 §5
+    // framing: Type + Length + Value), NOT in datagrams (RFC 9484 §4.7):
+    // tell the client the address/prefix it owns...
+    let assign = capsule::encode_address_assign(&[capsule::AssignedAddress {
+        request_id: 0,
         address: client_addr,
-        prefix_len: Some(prefix),
+        prefix_len: prefix,
     }]);
-    if sender.send_datagram(assign).is_err() {
-        debug!(peer = %peer, "datagram send failed sending Address Assign");
+    if let Err(e) = req_stream.send_data(assign).await {
+        debug!(peer = %peer, error = %e, "failed to send ADDRESS_ASSIGN capsule");
         let _ = req_stream.finish().await;
         return Ok(());
     }
 
-    // Advertise a default route so the client sends all traffic through us.
-    let route_adv = capsule::encode_route_advertisement(&[capsule::Route {
-        address: default_route_for(client_addr),
-        prefix_len: 0,
-    }]);
-    if sender.send_datagram(route_adv).is_err() {
-        debug!(peer = %peer, "datagram send failed sending Route Advertisement");
+    // ...and advertise a default route so the client sends all traffic through us.
+    let route_adv = capsule::encode_route_advertisement(&[default_route_range(client_addr)]);
+    if let Err(e) = req_stream.send_data(route_adv).await {
+        debug!(peer = %peer, error = %e, "failed to send ROUTE_ADVERTISEMENT capsule");
         let _ = req_stream.finish().await;
         return Ok(());
     }
 
-    // Data plane: tun <-> HTTP/3 DATAGRAM `IP` capsules.
+    // Split the request stream: the send half answers client ADDRESS_REQUEST
+    // capsules and finishes the stream at EOF; the recv half is decoded as an
+    // RFC 9297 capsule sequence by a dedicated reader task.
+    let (mut sig_send, mut sig_recv) = req_stream.split();
+
+    // Resolved when the capsule reader sees the stream EOF/error — that is the
+    // tunnel teardown signal (the control stream is the tunnel's lifetime).
+    let (teardown_tx, mut teardown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut pending = BytesMut::new();
+        'reader: loop {
+            match sig_recv.recv_data().await {
+                Ok(Some(mut chunk)) => {
+                    pending.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+                    // Bound memory on a malicious/garbled stream: RFC 9484
+                    // capsules we care about are tiny.
+                    if pending.len() > 1_048_576 {
+                        debug!(peer = %peer, "CONNECT-IP capsule buffer exceeded 1 MiB; aborting stream");
+                        break 'reader;
+                    }
+                    while let Some((typ, value, used)) = capsule::split_capsule(&pending) {
+                        let value = value.to_vec();
+                        let _ = pending.split_to(used);
+                        match typ {
+                            capsule::CAPSULE_ADDRESS_REQUEST => {
+                                match capsule::decode_address_value(&value) {
+                                    // RFC 9484 §4.7.2: a zero-entry
+                                    // ADDRESS_REQUEST must abort the stream.
+                                    Some(entries) if entries.is_empty() => {
+                                        debug!(peer = %peer, "client sent empty ADDRESS_REQUEST; aborting");
+                                        break 'reader;
+                                    }
+                                    Some(entries) => {
+                                        debug!(
+                                            peer = %peer,
+                                            requested = ?entries,
+                                            "client ADDRESS_REQUEST; responding with ADDRESS_ASSIGN"
+                                        );
+                                        // We always assign the same single
+                                        // pool address, so answer every
+                                        // Request ID with that assignment
+                                        // (matching Request ID per §4.7.2).
+                                        let replies: Vec<capsule::AssignedAddress> = entries
+                                            .iter()
+                                            .map(|r| capsule::AssignedAddress {
+                                                request_id: r.request_id,
+                                                address: client_addr,
+                                                prefix_len: prefix,
+                                            })
+                                            .collect();
+                                        let reply =
+                                            capsule::encode_address_assign(&replies);
+                                        if sig_send.send_data(reply).await.is_err() {
+                                            break 'reader;
+                                        }
+                                    }
+                                    None => {
+                                        // Malformed capsule: RFC 9484 §4.7.2
+                                        // defers to RFC 9297 §3.3 error
+                                        // handling — abort the request stream.
+                                        debug!(peer = %peer, "malformed ADDRESS_REQUEST; aborting");
+                                        break 'reader;
+                                    }
+                                }
+                            }
+                            capsule::CAPSULE_ROUTE_ADVERTISEMENT => {
+                                // The client advertises the route(s) it wants
+                                // us to carry. We ignore the content (we
+                                // always advertise a default route) but parse
+                                // it for observability.
+                                match capsule::decode_route_value(&value) {
+                                    Some(routes) => {
+                                        debug!(peer = %peer, routes = ?routes, "client ROUTE_ADVERTISEMENT")
+                                    }
+                                    None => debug!(peer = %peer, "malformed client ROUTE_ADVERTISEMENT ignored"),
+                                }
+                            }
+                            // ADDRESS_ASSIGN and anything else: accept and
+                            // ignore gracefully.
+                            _ => debug!(peer = %peer, type_ = typ, "ignoring unknown CONNECT-IP capsule"),
+                        }
+                    }
+                }
+                Ok(None) => break 'reader, // client finished the stream
+                Err(e) => {
+                    debug!(peer = %peer, error = %e, "CONNECT-IP capsule stream errored");
+                    break 'reader;
+                }
+            }
+        }
+        // Stream EOF/error: signal tunnel teardown, then close the stream.
+        let _ = teardown_tx.send(());
+        let _ = sig_send.finish().await;
+    });
+
+    // Data plane: tun <-> HTTP/3 DATAGRAMs (Context ID 0 + raw IP packet).
     let mut buf = vec![0u8; 65535];
     loop {
         tokio::select! {
             read = tun.read_packet(&mut buf) => {
                 match read {
                     Ok(n) if n > 0 => {
-                        let capsule = capsule::encode_ip_packet(&buf[..n]);
+                        // RFC 9484 §4.2: HTTP Datagram payload = Context ID
+                        // (varint) + IP packet. Context ID 0 = single 0x00 byte.
+                        let mut dgram = BytesMut::with_capacity(1 + n);
+                        dgram.put_u8(0x00);
+                        dgram.extend_from_slice(&buf[..n]);
+                        let dgram = dgram.freeze();
                         let too_big = match quinn_conn.max_datagram_size() {
-                            Some(max) => capsule.len() + DATAGRAM_OVERHEAD > max,
+                            Some(max) => dgram.len() + DATAGRAM_OVERHEAD > max,
                             None => true,
                         };
                         if too_big {
@@ -668,7 +830,7 @@ where
                             );
                             continue;
                         }
-                        if let Err(e) = sender.send_datagram(capsule) {
+                        if let Err(e) = sender.send_datagram(dgram) {
                             debug!(peer = %peer, error = %e, "datagram send error; ending tunnel");
                             break;
                         }
@@ -682,61 +844,34 @@ where
             }
             got = rx.recv() => {
                 match got {
-                    Some(capsule) => match capsule::decode_capsule(&capsule) {
-                        Some((capsule::CAPSULE_IP, _)) => {
-                            // The wire format is `Type=0x02 + Length + IP packet`.
-                            // Unpack just the packet and inject it into the tun
-                            // device; the kernel routes it onward (and NAT rewrites
-                            // it for egress).
-                            match capsule::decode_ip_packet(&capsule) {
-                                Some(pkt) => {
-                                    if let Err(e) = tun.write_packet(&pkt).await {
-                                        debug!(peer = %peer, error = %e, "tun write failed");
-                                    }
-                                }
-                                None => debug!(peer = %peer, "IP capsule with no payload dropped"),
+                    Some(dgram) => match capsule::strip_context_id(&dgram) {
+                        // Context ID 0: the remainder is the raw IP packet.
+                        // Inject it into the tun device; the kernel routes it
+                        // onward (and NAT rewrites it for egress).
+                        Some(pkt) => {
+                            if let Err(e) = tun.write_packet(pkt).await {
+                                debug!(peer = %peer, error = %e, "tun write failed");
                             }
                         }
-                        Some((capsule::CAPSULE_ADDRESS_REQUEST, req_val)) => {
-                            // The client may request specific address(es). We
-                            // always assign from our pool, so we parse the request
-                            // only to log it and then re-assert our assignment.
-                            if let Some(entries) = capsule::decode_address_value(&req_val) {
-                                debug!(
-                                    peer = %peer,
-                                    requested = ?entries,
-                                    "client Address Request; re-asserting assigned address"
-                                );
-                            }
-                            let assign = capsule::encode_address_assign(&[capsule::IpAddressEntry {
-                                address: client_addr,
-                                prefix_len: Some(prefix),
-                            }]);
-                            let _ = sender.send_datagram(assign);
-                        }
-                        Some((capsule::CAPSULE_ROUTE_ADVERTISEMENT, route_val)) => {
-                            // The client advertises the route(s) it wants us to
-                            // carry. We ignore the content (we always advertise a
-                            // default route) but parse it to validate framing and
-                            // for observability.
-                            if let Some(routes) = capsule::decode_route_value(&route_val) {
-                                debug!(peer = %peer, routes = ?routes, "client Route Advertisement");
-                            }
-                        }
-                        Some((typ, _)) => {
-                            debug!(peer = %peer, type_ = typ, "ignoring unknown CONNECT-IP capsule")
-                        }
-                        None => debug!(peer = %peer, stream = %stream_id, "malformed capsule dropped"),
+                        // Non-zero/truncated Context ID: drop silently, keep
+                        // the tunnel up (RFC 9484 §4.2).
+                        None => debug!(peer = %peer, stream = %stream_id, "datagram with non-zero or truncated Context ID dropped"),
                     },
                     None => break, // reader task gone / connection closed
                 }
             }
+            _ = &mut teardown_rx => {
+                // Control stream ended (client closed it, or the capsule
+                // reader aborted): the tunnel is over.
+                debug!(peer = %peer, stream = %stream_id, "CONNECT-IP control stream ended; tearing down");
+                break;
+            }
         }
     }
 
-    // Control stream closed: `tun` is dropped here, which removes the interface,
-    // the iptables rules, and restores `ip_forward`.
-    let _ = req_stream.finish().await;
+    // Teardown: `tun` is dropped here, which removes the interface, the
+    // iptables rules, and restores `ip_forward`. The capsule reader task owns
+    // the request stream halves and finishes the stream when it observes EOF.
     Ok(())
 }
 
@@ -812,6 +947,7 @@ fn is_connect_ip_path(path: &str) -> bool {
 /// extension: h3 0.0.8 cannot parse `connect-ip` as a `:protocol` at all (see
 /// `MASQUE_IP_PATH`), so once h3 learns it, the path is still a valid
 /// discriminator and a stray `connect-udp` on this path is rejected below.
+#[cfg(target_os = "linux")]
 fn validate_connect_ip(req: &Request<()>, token: Option<&str>) -> Result<(), StatusCode> {
     if req.method() != Method::CONNECT {
         return Err(StatusCode::METHOD_NOT_ALLOWED);
@@ -1066,12 +1202,24 @@ where
     Ok(())
 }
 
-/// All-zero address of the same family as `addr` (for the `0.0.0.0/0` / `::/0`
-/// default route advertisement).
-fn default_route_for(addr: IpAddr) -> IpAddr {
+/// The default-route `ROUTE_ADVERTISEMENT` range for the family of `addr`
+/// (RFC 9484 §4.7.3): `0.0.0.0–255.255.255.255` / `::–ffff:…:ffff`, all
+/// protocols (`ip_protocol = 0`).
+#[cfg(target_os = "linux")]
+fn default_route_range(addr: IpAddr) -> capsule::IpRange {
     match addr {
-        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        IpAddr::V4(_) => capsule::IpRange {
+            start: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            end: IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
+            ip_protocol: 0,
+        },
+        IpAddr::V6(_) => capsule::IpRange {
+            start: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            end: IpAddr::V6(Ipv6Addr::new(
+                0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+            )),
+            ip_protocol: 0,
+        },
     }
 }
 
@@ -1153,25 +1301,6 @@ async fn send_status<S: quic::SendStream<Bytes>>(
     Ok(())
 }
 
-/// Encode a UDP payload into an RFC 9297 `DATAGRAM` capsule:
-/// `Type=0x00 (varint)` + `Length (varint)` + `Value`.
-///
-/// The QUIC variable-length integer (RFC 9000 §16) and capsule framing are
-/// shared with CONNECT-IP and live in `crate::capsule`; this is a thin wrapper
-/// that pins the type to `UDP_DATAGRAM` (0x00) for the CONNECT-UDP path.
-pub(crate) fn encode_capsule(payload: &[u8]) -> Bytes {
-    capsule::encode_capsule(capsule::CAPSULE_DATAGRAM, payload)
-}
-
-/// Decode a `DATAGRAM` capsule back into its raw UDP payload. Returns `None`
-/// for a non-UDP_DATAGRAM type or a truncated/garbled capsule.
-pub(crate) fn decode_capsule(capsule: &[u8]) -> Option<Bytes> {
-    match capsule::decode_capsule(capsule) {
-        Some((capsule::CAPSULE_DATAGRAM, v)) => Some(v),
-        _ => None,
-    }
-}
-
 async fn load_certs(path: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     let mut reader = tokio::fs::File::open(path)
         .await
@@ -1205,8 +1334,8 @@ async fn load_key(path: &str) -> anyhow::Result<PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_proxy_auth, decode_capsule, encode_capsule, is_connect_ip_path, parse_target,
-        validate_connect_ip, validate_tcp_connect, validate_connect_udp,
+        check_proxy_auth, is_connect_ip_path, parse_target, validate_connect_ip,
+        validate_tcp_connect, validate_connect_udp,
     };
     use base64::Engine;
     use crate::server::{Host, parse_authority};
@@ -1266,29 +1395,6 @@ mod tests {
             );
         }
         req
-    }
-
-    #[test]
-    fn capsule_round_trip_small_and_large() {
-        for len in [0usize, 1, 63, 64, 100, 16383, 16384, 65535] {
-            let payload = vec![0xABu8; len];
-            let capsule = encode_capsule(&payload);
-            let decoded = decode_capsule(&capsule).expect("decode succeeds");
-            assert_eq!(decoded.as_ref(), &payload[..], "round trip failed at len {len}");
-        }
-    }
-
-    #[test]
-    fn capsule_rejects_unknown_type_and_truncated() {
-        // Type 0x01 (not UDP_DATAGRAM) should be rejected.
-        // Wire form: Type=0x01, Length=0x02, Value=[AA BB].
-        let bad = vec![0x01u8, 0x02, 0xAA, 0xBB];
-        assert!(decode_capsule(&bad).is_none());
-
-        // Truncated: claims length 10 but only 3 bytes follow.
-        // Wire form: Type=0x00, Length=0x0A, Value=[01 02 03].
-        let trunc = vec![0x00u8, 0x0A, 0x01, 0x02, 0x03];
-        assert!(decode_capsule(&trunc).is_none());
     }
 
     #[test]
@@ -1871,8 +1977,8 @@ async fn tcp_connect_pipe_logic_round_trips_and_eof_closes() {
 /// Real end-to-end test: drive the actual `MasqueServer` with a `quinn` + `h3`
 /// client over a freshly generated self-signed certificate. The client opens a
 /// `CONNECT-UDP` tunnel to a local UDP echo socket, then round-trips a UDP
-/// payload through HTTP/3 DATAGRAM capsules. This exercises the two defects the
-/// bind-only smoke test cannot catch:
+/// payload through HTTP/3 DATAGRAMs (Context ID 0 + raw payload, per RFC 9298
+/// §4.2). This exercises the two defects the bind-only smoke test cannot catch:
 ///
 ///   * the server MUST advertise DATAGRAM + extended-CONNECT settings, or the
 ///     client handshake / `send_request` fails;
@@ -1905,17 +2011,28 @@ mod e2e {
     use tokio::net::{TcpListener, UdpSocket};
     use tokio::sync::mpsc;
 
+    use crate::capsule;
     use crate::config::Cli;
-    use super::{MasqueServer, decode_capsule, encode_capsule};
+    use super::MasqueServer;
 
-    /// End-to-end CONNECT-IP test. With the patched h3, a `connect-ip`
-    /// `:protocol` is now representable, so the only remaining gate is root: the
-    /// server creates a real `tun` device, which requires `CAP_NET_ADMIN`. On a
-    /// non-root host (uid != 0) it skips gracefully. With root it would:
-    /// handshake, send `CONNECT-IP`, assert `200` + `Address Assign`, and
-    /// round-trip a ping through the tunnel. The full flow is left as a
-    /// clearly-labelled placeholder because it cannot execute without root in
-    /// this environment.
+    /// End-to-end CONNECT-IP test (RFC 9484). Requires root (`CAP_NET_ADMIN`):
+    /// the server creates a real `tun` device. On a non-root host (uid != 0) it
+    /// skips gracefully. With root it:
+    ///
+    ///   1. sends `CONNECT-IP` (`:protocol = connect-ip`, RFC 9484 default
+    ///      path) and asserts `200` + `Capsule-Protocol: ?1`;
+    ///   2. parses the RFC 9297 capsules from the **stream body** and asserts
+    ///      an `ADDRESS_ASSIGN` (0x01) and a `ROUTE_ADVERTISEMENT` (0x03)
+    ///      arrive with the RFC 9484 §4.7 layouts;
+    ///   3. first sends a datagram with a non-zero Context ID (varint 42) and
+    ///      verifies the tunnel survives;
+    ///   4. sends an ICMP echo request to the proxy's tun address as
+    ///      `Context ID 0 + raw IP packet` and expects the kernel's reply back
+    ///      the same way — proving the raw datagram data plane end-to-end.
+    ///
+    /// The client here is deliberately written to RFC 9484 directly (hand-built
+    /// bytes, no shared codec) so it verifies the *wire format*, not our own
+    /// encoder round-tripping itself.
     #[tokio::test]
     #[ignore = "requires openssl + root (CAP_NET_ADMIN); run: cargo test -- --ignored e2e_connect_ip_roundtrip"]
     async fn e2e_connect_ip_roundtrip() -> anyhow::Result<()> {
@@ -1931,10 +2048,286 @@ mod e2e {
             eprintln!("not root; skipping CONNECT-IP e2e (needs CAP_NET_ADMIN)");
             return Ok(());
         }
-        // NOTE: the live handshake + Address-Assign assertion + ping-through-
-        // tunnel flow would be implemented here once root is available. It is
-        // omitted because that gate is not met in CI/sandbox.
+
+        let _ = ring::default_provider().install_default();
+
+        let Some((key, cert)) = gen_cert() else {
+            eprintln!("openssl not available; skipping e2e CONNECT-IP test");
+            return Ok(());
+        };
+
+        let udp_port = free_udp_port();
+        let cli = Cli::parse_from([
+            "auto-server",
+            "--listen",
+            "127.0.0.1:0",
+            "--enable",
+            "h3",
+            "--key",
+            key.to_str().unwrap(),
+            "--cert-chain",
+            cert.to_str().unwrap(),
+            "--auth-token",
+            TOKEN,
+            "--h3-bind",
+            &format!("127.0.0.1:{udp_port}"),
+        ]);
+
+        let server = MasqueServer::new(cli.config)?;
+        let server_handle = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        // --- Build a quinn + h3 client that trusts our self-signed cert. ---
+        let cert_pem = std::fs::read(&cert).map_err(|e| anyhow!("read cert: {e}"))?;
+        let mut cert_reader = Cursor::new(cert_pem);
+        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+            .collect::<Result<_, _>>()
+            .map_err(|e| anyhow!("parse cert: {e}"))?;
+        let mut roots = RootCertStore::empty();
+        for c in &certs {
+            let _ = roots.add(c.clone());
+        }
+        let mut client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls)
+            .map_err(|e| anyhow!("quic client crypto: {e}"))?;
+        let mut client_cfg = ClientConfig::new(Arc::new(quic_crypto));
+        let mut tp = TransportConfig::default();
+        tp.datagram_receive_buffer_size(Some(64 * 1024));
+        client_cfg.transport_config(Arc::new(tp));
+
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap())?;
+        endpoint.set_default_client_config(client_cfg);
+
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), udp_port);
+        let quinn_conn = {
+            let mut conn = None;
+            let mut last_err: Option<String> = None;
+            for _ in 0..100 {
+                match endpoint.connect(server_addr, "localhost") {
+                    Ok(connecting) => match connecting.await {
+                        Ok(c) => {
+                            conn = Some(c);
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(format!("handshake: {e:?}"));
+                        }
+                    },
+                    Err(e) => {
+                        last_err = Some(format!("connect: {e:?}"));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            conn.ok_or_else(|| anyhow!("failed to connect to MASQUE server: {:?}", last_err))?
+        };
+
+        let h3_quinn_conn = H3QuinnConnection::new(quinn_conn);
+        let mut builder = h3::client::builder();
+        builder.enable_datagram(true);
+        builder.enable_extended_connect(true);
+        let (h3_conn, mut send_request) =
+            builder.build(h3_quinn_conn).await.map_err(|e| anyhow!("h3 client: {e}"))?;
+
+        // CONNECT-IP per RFC 9484 §4: `:protocol = connect-ip`, default path.
+        let mut req = Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("https://localhost:{udp_port}/.well-known/masque/ip/"))
+            .body(())
+            .expect("valid CONNECT-IP request");
+        req.headers_mut()
+            .insert("capsule-protocol", HeaderValue::from_static("?1"));
+        req.headers_mut().insert(
+            "proxy-authorization",
+            HeaderValue::from_str(&format!("Bearer {TOKEN}")).expect("auth header"),
+        );
+        req.extensions_mut()
+            .insert(Protocol::from_str("connect-ip").expect("patched h3 accepts connect-ip"));
+
+        let mut req_stream = send_request
+            .send_request(req)
+            .await
+            .map_err(|e| anyhow!("send_request: {e}"))?;
+        let resp = req_stream
+            .recv_response()
+            .await
+            .map_err(|e| anyhow!("recv_response: {e}"))?;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "CONNECT-IP must return 200, got {}",
+            resp.status()
+        );
+
+        // Read the signalling capsules from the stream body (RFC 9297 TLV
+        // framing on the stream) — they must NOT arrive as datagrams.
+        let mut body: Vec<u8> = Vec::new();
+        let mut assign: Option<Vec<capsule::AssignedAddress>> = None;
+        let mut routes: Option<Vec<capsule::IpRange>> = None;
+        loop {
+            let mut chunk = match req_stream.recv_data().await.map_err(|e| anyhow!("recv_data: {e}"))? {
+                Some(c) => c,
+                None => break,
+            };
+            body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+            let mut scanned = 0usize;
+            while let Some((typ, val, used)) = capsule::split_capsule(&body[scanned..]) {
+                scanned += used;
+                match typ {
+                    capsule::CAPSULE_ADDRESS_ASSIGN => {
+                        assign = Some(
+                            capsule::decode_address_value(val)
+                                .ok_or_else(|| anyhow!("malformed ADDRESS_ASSIGN"))?,
+                        );
+                    }
+                    capsule::CAPSULE_ROUTE_ADVERTISEMENT => {
+                        routes = Some(
+                            capsule::decode_route_value(val)
+                                .ok_or_else(|| anyhow!("malformed ROUTE_ADVERTISEMENT"))?,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            if assign.is_some() && routes.is_some() {
+                break;
+            }
+        }
+        let assign = assign
+            .ok_or_else(|| anyhow!("no ADDRESS_ASSIGN capsule on the request stream"))?;
+        let routes = routes
+            .ok_or_else(|| anyhow!("no ROUTE_ADVERTISEMENT capsule on the request stream"))?;
+        assert_eq!(assign.len(), 1, "expected exactly one assigned address");
+        assert!(!routes.is_empty(), "expected at least one advertised route");
+        let client_v4 = match assign[0].address {
+            std::net::IpAddr::V4(v4) => v4,
+            other => anyhow::bail!("expected a v4 assignment from the default pool, got {other}"),
+        };
+        eprintln!(
+            "ADDRESS_ASSIGN: {}/{}; ROUTE_ADVERTISEMENT: {} range(s)",
+            client_v4, assign[0].prefix_len, routes.len()
+        );
+
+        // The proxy's tun address is the peer of the client's on the PtP link
+        // (pool layout: proxy = block base+1, client = base+2).
+        let mut octets = client_v4.octets();
+        assert!(octets[3] >= 1, "client address must not be the block base");
+        octets[3] -= 1;
+        let proxy_v4 = std::net::Ipv4Addr::from(octets);
+
+        let stream_id = req_stream.id();
+        let mut sender = h3_conn.get_datagram_sender(stream_id);
+
+        // Client-side datagram reader: demultiplexes responses from the server.
+        let mut reader = h3_conn.get_datagram_reader();
+        let (dgram_tx, mut dgram_rx) = mpsc::unbounded_channel::<Bytes>();
+        tokio::spawn(async move {
+            while let Ok(d) = reader.read_datagram().await {
+                let payload = d.into_payload();
+                if dgram_tx.send(payload).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Negative control: a datagram with a non-zero Context ID (varint
+        // 0x40 0x2A = 42) must be dropped silently — the tunnel stays up.
+        sender
+            .send_datagram(Bytes::from(vec![0x40u8, 0x2A, 0x00]))
+            .map_err(|e| anyhow!("send_datagram(nonzero-cid): {e}"))?;
+
+        // Data plane: ICMP echo request to the proxy's tun address, as
+        // Context ID 0 (0x00) + RAW IP packet (no TLV, no Length). The kernel
+        // answers it locally (the address is on the tun device) and the reply
+        // must come back the same way.
+        let ping = icmpv4_echo_request(client_v4, proxy_v4, 0x1234, 1);
+        let mut dgram = Vec::with_capacity(1 + ping.len());
+        dgram.push(0x00);
+        dgram.extend_from_slice(&ping);
+        sender
+            .send_datagram(Bytes::from(dgram))
+            .map_err(|e| anyhow!("send_datagram(ping): {e}"))?;
+
+        let reply = tokio::time::timeout(Duration::from_secs(10), dgram_rx.recv())
+            .await
+            .map_err(|_| anyhow!("timed out waiting for ICMP echo reply"))?
+            .ok_or_else(|| anyhow!("datagram channel closed"))?;
+        assert_eq!(
+            reply[0], 0x00,
+            "reply datagram must start with Context ID 0 (0x00)"
+        );
+        let pkt = &reply[1..];
+        assert!(pkt.len() >= 20, "echo reply must be a raw IPv4 packet");
+        assert_eq!(pkt[0] >> 4, 4, "reply payload must be a RAW IPv4 packet (no capsule TLV)");
+        assert_eq!(pkt[9], 1, "reply must be ICMP");
+        assert_eq!(
+            std::net::Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]),
+            proxy_v4,
+            "echo reply source must be the proxy tun address"
+        );
+
+        // Clean up: keep handles alive until here, then tear down.
+        drop(req_stream);
+        drop(send_request);
+        drop(h3_conn);
+        endpoint.close(0u32.into(), b"test done");
+        server_handle.abort();
         Ok(())
+    }
+
+    /// Build a well-formed ICMPv4 echo request (`src -> dst`) as a raw IPv4
+    /// packet with correct header/ICMP checksums. Used by the root-gated
+    /// CONNECT-IP e2e.
+    fn icmpv4_echo_request(
+        src: std::net::Ipv4Addr,
+        dst: std::net::Ipv4Addr,
+        ident: u16,
+        seq: u16,
+    ) -> Vec<u8> {
+        let payload = b"masque-connect-ip-e2e-ping";
+        let mut icmp = Vec::with_capacity(8 + payload.len());
+        icmp.push(8); // type: echo request
+        icmp.push(0); // code
+        icmp.extend_from_slice(&[0, 0]); // checksum placeholder
+        icmp.extend_from_slice(&ident.to_be_bytes());
+        icmp.extend_from_slice(&seq.to_be_bytes());
+        icmp.extend_from_slice(payload);
+        let cs = ip_checksum(&icmp);
+        icmp[2..4].copy_from_slice(&cs.to_be_bytes());
+
+        let total = 20 + icmp.len();
+        let mut ip = Vec::with_capacity(total);
+        ip.push(0x45); // v4, IHL 5
+        ip.push(0); // DSCP/ECN
+        ip.extend_from_slice(&(total as u16).to_be_bytes());
+        ip.extend_from_slice(&[0, 0]); // identification
+        ip.extend_from_slice(&[0, 0]); // flags/fragment offset
+        ip.push(64); // TTL
+        ip.push(1); // protocol: ICMP
+        ip.extend_from_slice(&[0, 0]); // checksum placeholder
+        ip.extend_from_slice(&src.octets());
+        ip.extend_from_slice(&dst.octets());
+        let cs = ip_checksum(&ip);
+        ip[10..12].copy_from_slice(&cs.to_be_bytes());
+        ip.extend_from_slice(&icmp);
+        ip
+    }
+
+    /// RFC 1071 internet checksum.
+    fn ip_checksum(bytes: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for pair in bytes.chunks(2) {
+            let w = u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]);
+            sum += w as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
     }
 
     const TOKEN: &str = "test-masque-token";
@@ -2032,8 +2425,8 @@ mod e2e {
             cert.to_str().unwrap(),
             "--auth-token",
             TOKEN,
-            "--udp-port",
-            &udp_port.to_string(),
+            "--h3-bind",
+            &format!("127.0.0.1:{udp_port}"),
         ]);
 
         let server = MasqueServer::new(cli.config)?;
@@ -2161,22 +2554,63 @@ mod e2e {
             }
         });
 
-        // Send a UDP payload to the echo target via a DATAGRAM capsule.
+        // Send a UDP payload to the echo target. RFC 9298 §4.2 wire format:
+        // Context ID 0 (a single 0x00 byte) + the raw UDP payload — no TLV,
+        // no Length.
         let payload = b"masque-e2e-roundtrip-payload";
+        let mut dgram = Vec::with_capacity(1 + payload.len());
+        dgram.push(0x00);
+        dgram.extend_from_slice(payload);
         sender
-            .send_datagram(encode_capsule(payload))
+            .send_datagram(Bytes::from(dgram))
             .map_err(|e| anyhow!("send_datagram: {e}"))?;
 
-        // The echo socket bounces it back; the tunnel wraps it in a capsule.
+        // The echo socket bounces it back; the tunnel must return Context ID 0
+        // + the raw UDP payload.
         let got = tokio::time::timeout(Duration::from_secs(10), dgram_rx.recv())
             .await
             .map_err(|_| anyhow!("timed out waiting for echoed datagram"))?
             .ok_or_else(|| anyhow!("datagram channel closed"))?;
-        let decoded = decode_capsule(&got).expect("decoded echoed capsule");
         assert_eq!(
-            &decoded[..],
+            got[0], 0x00,
+            "server datagram must start with Context ID 0 (0x00), got {:02x?}",
+            &got[..got.len().min(8)]
+        );
+        assert_eq!(
+            &got[1..],
             payload,
             "echoed UDP payload did not round-trip through the tunnel"
+        );
+
+        // Negative control: a datagram whose leading varint Context ID is
+        // non-zero (0x40 0x2A = two-byte varint 42) must be dropped silently —
+        // the tunnel stays up and the payload is never echoed back.
+        let mut bad = vec![0x40u8, 0x2A];
+        bad.extend_from_slice(b"must-be-dropped");
+        sender
+            .send_datagram(Bytes::from(bad))
+            .map_err(|e| anyhow!("send_datagram(nonzero-cid): {e}"))?;
+
+        // A subsequent conformant datagram still round-trips (tunnel alive).
+        let payload2 = b"masque-e2e-after-nonzero-cid";
+        let mut dgram2 = Vec::with_capacity(1 + payload2.len());
+        dgram2.push(0x00);
+        dgram2.extend_from_slice(payload2);
+        sender
+            .send_datagram(Bytes::from(dgram2))
+            .map_err(|e| anyhow!("send_datagram(2): {e}"))?;
+        let got2 = tokio::time::timeout(Duration::from_secs(10), dgram_rx.recv())
+            .await
+            .map_err(|_| anyhow!("timed out waiting for post-control echo (tunnel died?)"))?
+            .ok_or_else(|| anyhow!("datagram channel closed"))?;
+        assert_eq!(got2[0], 0x00, "post-control datagram must also use Context ID 0");
+        assert_eq!(&got2[1..], payload2, "second echo mismatch");
+
+        // ...and the dropped payload must NEVER come back.
+        let extra = tokio::time::timeout(Duration::from_millis(500), dgram_rx.recv()).await;
+        assert!(
+            extra.is_err(),
+            "datagram with non-zero Context ID must be dropped silently, got {extra:?}"
         );
 
         // Clean up: keep handles alive until here, then tear down.
@@ -2232,8 +2666,8 @@ mod e2e {
             cert.to_str().unwrap(),
             "--auth-token",
             TOKEN,
-            "--udp-port",
-            &udp_port.to_string(),
+            "--h3-bind",
+            &format!("127.0.0.1:{udp_port}"),
         ]);
 
         let server = MasqueServer::new(cli.config)?;
@@ -2471,8 +2905,8 @@ mod e2e {
             cert.to_str().unwrap(),
             "--auth-token",
             TOKEN,
-            "--udp-port",
-            &udp_port.to_string(),
+            "--h3-bind",
+            &format!("127.0.0.1:{udp_port}"),
         ]);
 
         let server = MasqueServer::new(cli.config)?;

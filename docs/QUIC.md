@@ -9,8 +9,9 @@ IP-tunnelling VPN gateway:
    client's UDP payloads over HTTP/3 DATAGRAMs (RFC 9297). This lets an **HTTP proxy**
    client (e.g. Chrome configured as an HTTP/HTTPS proxy) also reach QUIC origins.
 3. **HTTP/3 MASQUE (`CONNECT-IP`, RFC 9484)** (new) — on the same listener, act as a layer-3
-   VPN gateway: assign the client an IP, carry IP packets as HTTP/3 DATAGRAM `IP` capsules, and
-   NAT the client's traffic for egress (see §3). Requires root.
+   VPN gateway: assign the client an IP, carry IP packets as HTTP/3 DATAGRAMs (`Context ID 0` +
+   the raw packet, RFC 9484 §4.2), signal addresses/routes as RFC 9297 capsules **on the request
+   stream**, and NAT the client's traffic for egress (see §3). Requires root.
 4. **Plain TCP `CONNECT` over HTTP/3 (RFC 9114 §4.4)** — a *non-extended* `CONNECT` (no
    `:protocol` token) that tunnels **arbitrary TCP** byte streams over a single HTTP/3 request
    stream. Unlike `CONNECT-UDP`/`CONNECT-IP` it uses no capsules and no DATAGRAMs — the request
@@ -98,7 +99,9 @@ implements MASQUE `CONNECT-UDP`. By default it runs *alongside* the existing TCP
 MASQUE lets an HTTP/HTTPS-proxy client tunnel UDP (and therefore QUIC) through the proxy without
 needing SOCKS5. The client opens an HTTP/3 connection, sends `CONNECT-UDP` with `:protocol:
 connect-udp` and a `Capsule-Protocol: ?1` header, and then exchanges UDP payloads as HTTP/3
-DATAGRAMs (RFC 9297) whose body is a `DATAGRAM` capsule (type `0x00` = UDP payload, RFC 9298 §4).
+DATAGRAMs (RFC 9297) whose payload is `Context ID 0` — a single `0x00` byte — followed by the
+**raw** UDP payload (RFC 9297 §4 / RFC 9298 §4.2). No capsule TLV, no Length: datagrams carry
+`Context ID (varint)` + data only, and datagrams with any other Context ID are dropped silently.
 
 ## Request form (RFC 9298 §3.4)
 
@@ -147,7 +150,7 @@ that future option is now implemented.)
 ## Flags
 
 ```
-auto-server --enable h3 --key xxx.pem --cert-chain xxxfull.chain.pem --udp-port 443 --auth-token <TOKEN>
+auto-server --enable h3 --key xxx.pem --cert-chain xxxfull.chain.pem --h3-bind 0.0.0.0:443 --auth-token <TOKEN>
 ```
 
 | Flag | Meaning |
@@ -156,8 +159,11 @@ auto-server --enable h3 --key xxx.pem --cert-chain xxxfull.chain.pem --udp-port 
 | `--key <PATH>` | PEM private key for the QUIC/HTTP/3 listener. **Required** when `--enable h3`. |
 | `--cert-chain <PATH>` | PEM certificate chain (fullchain) for the QUIC/HTTP/3 listener. **Required** when `--enable h3`. |
 | `--auth-token <TOKEN>` | Shared secret. **Required** when `--enable h3`. See auth below. |
-| `--udp-port <PORT>` | UDP port for the QUIC listener. **Optional, default `443`.** Bound to `--listen`'s IP (so `--listen 0.0.0.0` → `0.0.0.0:443`), no separate bind-address flag is needed. |
+| `--h3-bind <ADDR:PORT>` | Full bind address (IP:port) for the QUIC listener. **Optional, default `0.0.0.0:443`.** Independent of `--listen`: the TCP proxy and the MASQUE endpoint each have their own bind address. |
 | `--disable http` | Do not start the TCP listener on `--listen` at all, so **only** MASQUE runs. Optional. Requires `--enable h3`. |
+
+`--listen` is purely the TCP proxy's bind address (SOCKS4/SOCKS5/HTTP CONNECT, default
+`0.0.0.0:1080`); it has no influence on the MASQUE bind, which is `--h3-bind` alone.
 
 `--key`, `--cert-chain`, and `--auth-token` are enforced by `clap` (`required_if_eq` on
 `--enable h3`) and re-checked defensively in `run()`. Omitting any of them aborts with a clear
@@ -167,11 +173,11 @@ message before binding.
 
 The TCP listener on `--listen` serves SOCKS4, SOCKS5 **and** HTTP `CONNECT` together (it
 auto-detects the protocol per connection), so `--disable http` disables **all three** — it is not
-an HTTP-only toggle. With `--disable http`, `--listen` is never bound; only its IP is still used
-to derive the MASQUE bind address (`--listen`'s IP + `--udp-port`).
+an HTTP-only toggle. With `--disable http`, `--listen` is never bound; the MASQUE listener binds
+`--h3-bind` instead, which is fully independent of `--listen`.
 
 ```
-auto-server --enable h3 --disable http --key key.pem --cert-chain cert.pem --auth-token <TOKEN> --udp-port 8443
+auto-server --enable h3 --disable http --key key.pem --cert-chain cert.pem --auth-token <TOKEN> --h3-bind 0.0.0.0:8443
 ```
 
 **Validation rule:** `--disable http` requires `--enable h3`. With no `--enable h3` there would
@@ -214,7 +220,7 @@ responds `407 Proxy Authentication Required`. Two schemes are accepted:
 
 ## Client configuration
 
-Configure the browser/system as an **HTTP/HTTPS proxy** pointing at `https://<host>:<udp-port>/`
+Configure the browser/system as an **HTTP/HTTPS proxy** pointing at `https://<host>:<h3-bind-port>/`
 with the proxy auth credential above, and ensure HTTP/3 (QUIC) is enabled. Chrome, for example,
 tunnels QUIC to origins through an HTTP proxy via MASQUE `CONNECT-UDP` when so configured.
 
@@ -230,7 +236,7 @@ this server's mandatory auth).
 
 QUIC datagrams are MTU-bounded (initially ~1200 bytes, growing with path MTU discovery). A UDP
 packet larger than the current datagram MTU cannot be sent as a single HTTP/3 DATAGRAM. The server
-pre-checks each outgoing capsule against `quinn`'s live `max_datagram_size()` and **drops** packets
+pre-checks each outgoing datagram against `quinn`'s live `max_datagram_size()` and **drops** packets
 that would not fit, logging at debug level and relying on the client's own retransmission (per RFC
 9298). It never panics or tears down the tunnel for an oversized packet. Note that the
 `h3-datagram` 0.0.2 `SendDatagramError` variants are private, so the server pre-checks the MTU
@@ -243,18 +249,18 @@ rather than matching the `TooLarge` error at runtime.
 openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 -subj "/CN=localhost"
 
 # 2. Start with MASQUE enabled (use a high UDP port to avoid needing root for 443):
-auto-server --enable h3 --key key.pem --cert-chain cert.pem --auth-token s3cr3t --udp-port 8443 --listen 127.0.0.1:1080
-#    -> expect both log lines:
+auto-server --enable h3 --key key.pem --cert-chain cert.pem --auth-token s3cr3t --h3-bind 127.0.0.1:8443 --listen 127.0.0.1:1080
+#    -> expect both log lines (the two binds are independent):
 #       proxy server started listen=127.0.0.1:1080 ...
 #       masque (HTTP/3 CONNECT-UDP) server started listen=127.0.0.1:8443
 
 # 3. Missing auth-token is rejected before binding:
-auto-server --enable h3 --key key.pem --cert-chain cert.pem --udp-port 8443
+auto-server --enable h3 --key key.pem --cert-chain cert.pem --h3-bind 127.0.0.1:8443
 #    -> error: the following required arguments were not provided: --auth-token <AUTH_TOKEN>
 
 # 4. MASQUE-only: no TCP listener at all (1080 is never bound)
-auto-server --enable h3 --disable http --key key.pem --cert-chain cert.pem --auth-token s3cr3t --udp-port 8443
-#    -> only: "masque (HTTP/3 CONNECT-UDP) server started listen=0.0.0.0:8443"
+auto-server --enable h3 --disable http --key key.pem --cert-chain cert.pem --auth-token s3cr3t --h3-bind 127.0.0.1:8443
+#    -> only: "masque (HTTP/3 CONNECT-UDP) server started listen=127.0.0.1:8443"
 #       (no "proxy server started" line; nothing listening on 1080)
 
 # 5. --disable http without --enable h3 is rejected before binding:
@@ -267,7 +273,8 @@ auto-server --disable http
 `src/masque.rs` also contains `e2e_connect_udp_roundtrip` — a real handshake that drives the
 actual `MasqueServer` with a `quinn` + `h3` client over a freshly generated self-signed
 certificate, sends `CONNECT-UDP` (in the RFC 9298 `:path` form above), asserts `200`, and
-round-trips a UDP payload through a local echo socket via HTTP/3 DATAGRAM capsules. It is
+round-trips a UDP payload through a local echo socket via HTTP/3 DATAGRAMs (`0x00` + raw payload
+both directions). It is
 `#[ignore]`d (and a no-op if `openssl` is absent) so it does not run in the default `cargo test`:
 
 ```
@@ -314,10 +321,19 @@ accepts it as an end-entity.
 
 # 3. HTTP/3 MASQUE (CONNECT-IP, RFC 9484) — VPN gateway
 
+> **Platform support:** `CONNECT-IP` (the `tun` device, NAT, and route setup) is
+> **Linux-only** (`cfg(target_os = "linux")`). It uses the Linux `TUNSETIFF`
+> ioctl, `/proc/sys/net/ipv4/ip_forward`, and `iptables`. On Windows and macOS
+> builds the module is compiled out; a `connect-ip` request is answered with
+> `501 Not Implemented` and a "CONNECT-IP requires Linux" log line, while
+> `CONNECT-UDP`, plain TCP `CONNECT`, and WebSocket-over-HTTP/3 are served as
+> usual.
+
 When `--enable h3` is on, the **same** QUIC/HTTP/3 listener also serves `CONNECT-IP` (RFC 9484),
 the IP-tunneling sibling of `CONNECT-UDP`. Whereas `CONNECT-UDP` tunnels a single UDP flow,
 `CONNECT-IP` turns the proxy into a **real layer-3 VPN gateway**: the client gets a routable IP
-address, its traffic is carried as IP packets inside HTTP/3 DATAGRAM `IP` capsules, the proxy
+address, its traffic is carried as IP packets inside HTTP/3 DATAGRAMs (`Context ID 0` + the raw
+IP packet, RFC 9484 §4.2 — no capsule TLV), the proxy
 performs NAT for egress, and the client can reach the entire Internet (or any advertised prefix)
 through the tunnel.
 
@@ -341,21 +357,40 @@ connects to the well-known prefix:
 capsule-protocol = ?1
 ```
 
-After a `200` + `Capsule-Protocol: ?1` response, the proxy and client exchange RFC 9297 capsules
-inside HTTP/3 DATAGRAMs (Context ID 0, exactly like `CONNECT-UDP`):
+After a `200` + `Capsule-Protocol: ?1` response there are two distinct planes:
+
+**Datagram plane (data):** IP packets travel in HTTP/3 DATAGRAMs whose payload is `Context ID 0`
+(a single `0x00` byte) followed by the **raw IP packet** — exactly like CONNECT-UDP, no capsule
+TLV, no Length (RFC 9297 §4 / RFC 9484 §4.2). Datagrams with a non-zero Context ID are dropped
+silently without tearing the tunnel down.
+
+**Request stream (signalling):** RFC 9297 capsules (TLV framing: `Type` varint + `Length` varint
++ `Value`) travel **on the CONNECT request stream** via `send_data`/`recv_data` — never in
+datagrams (RFC 9484 §4.7):
 
 | Capsule type | Value | Direction | Purpose |
 | --- | --- | --- | --- |
-| `IP` (0x02) | raw IP packet | both | the tunnelled packet |
-| `Address Assign` (0x03) | address(es)/prefix(es) | proxy → client | the client's assigned address |
-| `Address Request` (0x04) | address(es) | client → proxy | client asks for an address (we always assign from the pool) |
-| `Route Advertisement` (0x05) | route(s)/prefix(es) | proxy → client | prefixes the client should route through us |
-| `New Client Address` (0x01) | — | — | **deprecated**; accepted on decode, never sent/required |
+| `ADDRESS_ASSIGN` (0x01) | assigned address(es)/prefix(es) | proxy → client | the client's assigned address (sent unprompted after the 2xx, and in reply to `ADDRESS_REQUEST`) |
+| `ADDRESS_REQUEST` (0x02) | requested address(es) | client → proxy | client asks for an address (we always assign from the pool, echoing the Request ID) |
+| `ROUTE_ADVERTISEMENT` (0x03) | address range(s) | proxy → client | ranges we are willing to route (default route: `0.0.0.0–255.255.255.255`, all protocols) |
 
-The address/route capsule bodies are themselves a Type-Length-Value sequence of RFC 9484
-structured fields (`IPv4 Address` 0x04, `IPv6 Address` 0x06, `Prefix Length` 0x05; `IPv6 Suffix`
-0x08 is defined but unused here), i.e. a capsule nested inside a capsule. All encode/decode lives
-in `src/capsule.rs` and is unit-tested without root or a device.
+The capsule payloads use the **fixed RFC 9484 layouts** (§4.7 Figures 8/10/12) — not nested TLVs:
+
+- `Assigned Address` / `Requested Address`:
+  `Request ID (varint), IP Version (8 bits), IP Address (32/128 bits), IP Prefix Length (8 bits)`
+  — e.g. `01 07 00 04 c6 12 00 02 20` is an `ADDRESS_ASSIGN` for `198.18.0.2/32` with Request
+  ID 0.
+- `IP Address Range`:
+  `IP Version (8 bits), Start IP Address (32/128), End IP Address (32/128), IP Protocol (8 bits)`
+  — `0` means all protocols (ICMP is always allowed); e.g. `03 0a 04 00 00 00 00 ff ff ff ff 00`
+  is the IPv4 default route.
+
+> **Note:** an earlier implementation of this server used a home-grown wire format here (an
+> invented `IP` capsule 0x02 with TLV-framed addresses, renumbered capsule types, and signalling
+> capsules sent as datagrams). That was **not** RFC 9484-conformant; it has been fixed, so
+> third-party RFC-conforming clients (e.g. [masque-go](https://github.com/quic-go/masque-go)) are
+> now expected to interoperate. All encode/decode lives in `src/capsule.rs` and is unit-tested
+> against hand-derived RFC byte sequences without root or a device.
 
 ## Address pool (`--ip-pool`)
 
@@ -408,13 +443,17 @@ use the kernel's `auto%d` auto-naming template so concurrent tunnels never colli
 
 After setup, `handle_ip_stream` loops:
 
-- **Uplink (client → Internet):** incoming `IP` capsules are unpacked and written to the tun
-  device; the kernel routes/NATs them to the real egress interface.
-- **Downlink (Internet → client):** every packet read from the tun device is wrapped in an `IP`
-  capsule and sent as an HTTP/3 DATAGRAM (pre-checked against `max_datagram_size()`; oversized
-  packets are dropped, never fatal).
-- **Address Request** / **Route Advertisement** capsules from the client are parsed and observed
-  (the proxy always re-asserts its own assignment and advertises a default route).
+- **Uplink (client → Internet):** each incoming HTTP/3 DATAGRAM's Context ID varint is parsed; a
+  non-zero Context ID is dropped silently (RFC 9484 §4.2), Context ID 0 is followed by the raw IP
+  packet, which is written to the tun device; the kernel routes/NATs it to the real egress
+  interface.
+- **Downlink (Internet → client):** every packet read from the tun device is sent as an HTTP/3
+  DATAGRAM consisting of `0x00` (Context ID 0) + the raw packet (pre-checked against
+  `max_datagram_size()`; oversized packets are dropped, never fatal).
+- **Signalling** (`ADDRESS_REQUEST` from the client, and the unprompted `ADDRESS_ASSIGN` +
+  `ROUTE_ADVERTISEMENT` the proxy sends) travels as RFC 9297 capsules **on the request stream**,
+  never in datagrams. A client `ADDRESS_REQUEST` is answered with a matching-Request-ID
+  `ADDRESS_ASSIGN`; stream EOF is the tunnel teardown signal.
 
 ## Authentication (required)
 
@@ -427,7 +466,7 @@ method, on a non-`/masque/ip` path, or if a `CONNECT-UDP` request lands on the I
 
 ```
 auto-server --enable h3 --key key.pem --cert-chain cert.pem --auth-token <TOKEN> \
-            --ip-pool 198.18.0.0/15 --udp-port 8443
+            --ip-pool 198.18.0.0/15 --h3-bind 0.0.0.0:8443
 ```
 
 `--enable h3`, `--key`, `--cert-chain`, `--auth-token` behave exactly as in §2. `--ip-pool` is the
@@ -441,7 +480,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 
 
 # 2. Start (must be root for tun/NAT; use a high UDP port to avoid needing root for 443):
 sudo auto-server --enable h3 --key key.pem --cert-chain cert.pem --auth-token s3cr3t \
-                 --ip-pool 198.18.0.0/15 --udp-port 8443
+                 --ip-pool 198.18.0.0/15 --h3-bind 0.0.0.0:8443
 
 # 3. After a client connects you should see:
 #       CONNECT-IP tunnel established tun=tun0 proxy=198.18.0.0 client=198.18.0.2 prefix=30
@@ -456,20 +495,26 @@ sudo auto-server --enable h3 --key key.pem --cert-chain cert.pem --auth-token s3
 `cargo test` covers the pure protocol logic without any device or privileges:
 
 - `capsule` module: QUIC varint round-trips (1/2/4/8-byte forms + boundaries), capsule
-  encode/decode round-trips (including a 20 000-byte value forcing a 4-byte `Length`), `IP`
-  capsule round-trip, `Address Assign`/`Address Request`/`Route Advertisement` parsing for IPv4 and
-  IPv6, host-assignment (no prefix), and rejection of malformed/truncated/unknown-field input.
+  encode/decode round-trips (including a 20 000-byte value forcing a 4-byte `Length`),
+  Context-ID parsing (`0x00` accepted and stripped; single-byte and multi-byte varint non-zero
+  Context IDs, e.g. `0x40 0x2A`, dropped), and `ADDRESS_ASSIGN`/`ADDRESS_REQUEST`/
+  `ROUTE_ADVERTISEMENT` codec tests that assert the exact RFC 9484 §4.7 byte sequences (e.g. an
+  `ADDRESS_ASSIGN` for `198.18.0.2/32` = `01 07 00 04 c6 12 00 02 20`) plus rejection of
+  malformed/truncated input (wrong IP version, truncated addresses, Start > End, out-of-range
+  prefix lengths).
 - `tun` module: pool allocation (distinct `/30` blocks), exhaustion, bad-CIDR rejection, and a
   `cstr`-to-`String` helper. The real device/routing/NAT test (`tun_integration`) is `#[ignore]`d
   and additionally skips unless `uid == 0` and `ip`/`iptables` exist.
 - `masque` module: `connect-ip` path detection, `validate_connect_ip` accept/reject matrix
   (method, path, capsule-protocol, auth, and a `CONNECT-UDP` request on the IP path), and the
-  `CONNECT-UDP` capsule/validation tests.
+  `CONNECT-UDP` request-validation tests.
 
 ### Integration / end-to-end test (root, `#[ignore]`)
 
 `tun_integration` (real tun + NAT) and `e2e_connect_ip_roundtrip` (live QUIC handshake asserting
-`200` + `Address Assign` and a ping through the tunnel) are both `#[ignore]`d and gated on root +
+`200`, parsing `ADDRESS_ASSIGN`/`ROUTE_ADVERTISEMENT` capsules **from the stream body**, and
+pinging the proxy's tun address through the tunnel with `Context ID 0` + raw-packet datagrams,
+including a non-zero-Context-ID silent-drop control) are both `#[ignore]`d and gated on root +
 tool availability. They are **not** executed in the sandbox/CI environment (no root) and must be
 run explicitly:
 
@@ -494,7 +539,10 @@ cargo test -- --ignored e2e_connect_ip_roundtrip
   unit-tested; only the live end-to-end handshake is gated on root (`CAP_NET_ADMIN`).
 - **Chrome cannot be used as a client** for the same two reasons as `CONNECT-UDP` (no
   `Proxy-Authorization` from Chrome's MASQUE client; `quic://` proxy support is debug-build only).
-  Use a `connect-ip`-capable reference client (e.g. a `connect-ip-rs`-based client) for interop.
+  Use a `connect-ip`-capable reference client (e.g. [masque-go](https://github.com/quic-go/masque-go))
+  for interop. Third-party RFC 9484/9298-conforming clients are expected to interoperate since the
+  wire-format fix (see the note in "Request form" above): datagrams are now `Context ID 0` + raw
+  payloads and signalling capsules travel on the request stream.
 - **IPv4-only egress NAT by default.** The MASQUERADE/forwarding rules are installed per allocated
   prefix; a dual-stack client is served on whichever family its assigned address is, but the
   default route advertisement is per-family based on the assigned address.
@@ -592,10 +640,10 @@ is set). Missing/wrong token → `407 Proxy Authentication Required`. Accepted s
 ## Flags
 
 No new flags. Plain TCP `CONNECT` is served automatically by the existing `--enable h3` listener and
-shares `--auth-token`, `--key`, `--cert-chain`, and `--udp-port` with `CONNECT-UDP`/`CONNECT-IP`.
+shares `--auth-token`, `--key`, `--cert-chain`, and `--h3-bind` with `CONNECT-UDP`/`CONNECT-IP`.
 
 ```
-auto-server --enable h3 --key key.pem --cert-chain cert.pem --auth-token <TOKEN> --udp-port 8443
+auto-server --enable h3 --key key.pem --cert-chain cert.pem --auth-token <TOKEN> --h3-bind 0.0.0.0:8443
 ```
 
 ## Verification / automated end-to-end test

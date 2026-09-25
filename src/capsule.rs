@@ -29,6 +29,14 @@
 //!
 //! All of this is pure, allocation-light, and fully unit-testable without root
 //! or a network device.
+//!
+//! The codec is **public** (the module is re-exported as `auto_server::capsule`)
+//! so that external tooling — notably the `masque-client` binary in `src/bin`
+//! — encodes and decodes exactly the same bytes rather than re-deriving the
+//! format. Consequence worth remembering: a green `masque-client` round-trip
+//! proves the *server* works end-to-end but is **not** an independent wire-format
+//! conformance check (that role belongs to a third-party client such as
+//! masque-go).
 
 // The CONNECT-IP signalling encoders are only wired up on Linux (the tun/NAT
 // data plane, see `lib.rs`); silence the dead-code warnings elsewhere.
@@ -44,15 +52,15 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 /// `ADDRESS_ASSIGN` (0x01) — an endpoint assigns its peer IP addresses or
 /// prefixes (RFC 9484 §4.7.1).
-pub(crate) const CAPSULE_ADDRESS_ASSIGN: u64 = 0x01;
+pub const CAPSULE_ADDRESS_ASSIGN: u64 = 0x01;
 
 /// `ADDRESS_REQUEST` (0x02) — an endpoint requests address assignment from its
 /// peer (RFC 9484 §4.7.2).
-pub(crate) const CAPSULE_ADDRESS_REQUEST: u64 = 0x02;
+pub const CAPSULE_ADDRESS_REQUEST: u64 = 0x02;
 
 /// `ROUTE_ADVERTISEMENT` (0x03) — an endpoint advertises the IP address ranges
 /// it is willing to route for its peer (RFC 9484 §4.7.3).
-pub(crate) const CAPSULE_ROUTE_ADVERTISEMENT: u64 = 0x03;
+pub const CAPSULE_ROUTE_ADVERTISEMENT: u64 = 0x03;
 
 // ---------------------------------------------------------------------------
 // CONNECT-IP signalling structures (RFC 9484 §4.7)
@@ -62,7 +70,7 @@ pub(crate) const CAPSULE_ROUTE_ADVERTISEMENT: u64 = 0x03;
 /// §4.7.2 Figure 10). The prefix length is mandatory (`/32` for a single host
 /// IPv4 assignment, `/128` for IPv6).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AssignedAddress {
+pub struct AssignedAddress {
     /// Echoed in the ADDRESS_ASSIGN response; 0 for unprompted assignments.
     pub request_id: u64,
     pub address: IpAddr,
@@ -73,7 +81,7 @@ pub(crate) struct AssignedAddress {
 /// `start..=end` for `ip_protocol` (`0` = all protocols; ICMP is always
 /// allowed).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IpRange {
+pub struct IpRange {
     pub start: IpAddr,
     pub end: IpAddr,
     pub ip_protocol: u8,
@@ -84,7 +92,7 @@ pub(crate) struct IpRange {
 // ---------------------------------------------------------------------------
 
 /// Encode a capsule: `Type` (varint) + `Length` (varint) + `Value`.
-pub(crate) fn encode_capsule(typ: u64, value: &[u8]) -> Bytes {
+pub fn encode_capsule(typ: u64, value: &[u8]) -> Bytes {
     let mut buf = BytesMut::with_capacity(8 + value.len());
     put_varint(&mut buf, typ);
     put_varint(&mut buf, value.len() as u64);
@@ -97,7 +105,7 @@ pub(crate) fn encode_capsule(typ: u64, value: &[u8]) -> Bytes {
 /// capsule occupied (so a stream reader can advance past it). Returns `None`
 /// if the framing is incomplete or garbled (a partial varint, or a `Length`
 /// claiming more bytes than remain) — the caller should wait for more bytes.
-pub(crate) fn split_capsule(bytes: &[u8]) -> Option<(u64, &[u8], usize)> {
+pub fn split_capsule(bytes: &[u8]) -> Option<(u64, &[u8], usize)> {
     let mut buf = bytes;
     let typ = get_varint(&mut buf)?;
     let len = get_varint(&mut buf)? as usize;
@@ -112,7 +120,7 @@ pub(crate) fn split_capsule(bytes: &[u8]) -> Option<(u64, &[u8], usize)> {
 
 /// Decode the first capsule, returning `(Type, Value)`. Returns `None` if the
 /// framing is truncated or garbled.
-pub(crate) fn decode_capsule(bytes: &[u8]) -> Option<(u64, Bytes)> {
+pub fn decode_capsule(bytes: &[u8]) -> Option<(u64, Bytes)> {
     let (typ, value, _) = split_capsule(bytes)?;
     Some((typ, Bytes::copy_from_slice(value)))
 }
@@ -123,7 +131,7 @@ pub(crate) fn decode_capsule(bytes: &[u8]) -> Option<(u64, Bytes)> {
 /// context we use. `None` means "drop this datagram silently": a non-zero
 /// Context ID we did not negotiate, or a truncated varint. Dropping must not
 /// error the tunnel (RFC 9298 §4.2 / RFC 9484 §4.2).
-pub(crate) fn strip_context_id(dgram: &[u8]) -> Option<&[u8]> {
+pub fn strip_context_id(dgram: &[u8]) -> Option<&[u8]> {
     let mut buf = dgram;
     let cid = get_varint(&mut buf)?;
     if cid == 0 {
@@ -140,7 +148,7 @@ pub(crate) fn strip_context_id(dgram: &[u8]) -> Option<&[u8]> {
 /// Encode the payload of an `ADDRESS_ASSIGN` or `ADDRESS_REQUEST` capsule:
 /// a sequence of `Assigned Address` / `Requested Address` structures
 /// (identical layout).
-pub(crate) fn encode_address_value(entries: &[AssignedAddress]) -> Bytes {
+pub fn encode_address_value(entries: &[AssignedAddress]) -> Bytes {
     let mut v = BytesMut::new();
     for e in entries {
         put_varint(&mut v, e.request_id);
@@ -162,7 +170,7 @@ pub(crate) fn encode_address_value(entries: &[AssignedAddress]) -> Bytes {
 /// Parse the payload of an `ADDRESS_ASSIGN` / `ADDRESS_REQUEST` capsule.
 /// Returns `None` on malformed input (truncated, IP Version not 4/6, address
 /// of the wrong length, prefix length exceeding the address size).
-pub(crate) fn decode_address_value(value: &[u8]) -> Option<Vec<AssignedAddress>> {
+pub fn decode_address_value(value: &[u8]) -> Option<Vec<AssignedAddress>> {
     let mut entries = Vec::new();
     let mut buf = value;
 
@@ -206,7 +214,7 @@ pub(crate) fn decode_address_value(value: &[u8]) -> Option<Vec<AssignedAddress>>
 }
 
 /// Encode a full `ADDRESS_ASSIGN` capsule (TLV + payload).
-pub(crate) fn encode_address_assign(entries: &[AssignedAddress]) -> Bytes {
+pub fn encode_address_assign(entries: &[AssignedAddress]) -> Bytes {
     encode_capsule(CAPSULE_ADDRESS_ASSIGN, &encode_address_value(entries))
 }
 
@@ -216,14 +224,14 @@ pub(crate) fn encode_address_assign(entries: &[AssignedAddress]) -> Bytes {
 /// RFC 9484 §4.7.2); this is part of the complete capsule API and is exercised
 /// by the unit tests, hence `allow(dead_code)`.
 #[allow(dead_code)]
-pub(crate) fn encode_address_request(entries: &[AssignedAddress]) -> Bytes {
+pub fn encode_address_request(entries: &[AssignedAddress]) -> Bytes {
     encode_capsule(CAPSULE_ADDRESS_REQUEST, &encode_address_value(entries))
 }
 
 /// Decode a full `ADDRESS_ASSIGN` capsule (TLV + payload), or `None` if it is
 /// not an ADDRESS_ASSIGN or the payload is malformed.
 #[allow(dead_code)]
-pub(crate) fn decode_address_assign(capsule: &[u8]) -> Option<Vec<AssignedAddress>> {
+pub fn decode_address_assign(capsule: &[u8]) -> Option<Vec<AssignedAddress>> {
     match decode_capsule(capsule) {
         Some((CAPSULE_ADDRESS_ASSIGN, v)) => decode_address_value(&v),
         _ => None,
@@ -236,7 +244,7 @@ pub(crate) fn decode_address_assign(capsule: &[u8]) -> Option<Vec<AssignedAddres
 
 /// Encode the payload of a `ROUTE_ADVERTISEMENT` capsule: a sequence of
 /// `IP Address Range` structures.
-pub(crate) fn encode_route_value(ranges: &[IpRange]) -> Bytes {
+pub fn encode_route_value(ranges: &[IpRange]) -> Bytes {
     let mut v = BytesMut::new();
     for r in ranges {
         match r.start {
@@ -261,7 +269,7 @@ pub(crate) fn encode_route_value(ranges: &[IpRange]) -> Bytes {
 /// Parse the payload of a `ROUTE_ADVERTISEMENT` capsule. Returns `None` on
 /// malformed input (truncated, IP Version not 4/6, Start > End, or start/end
 /// of different families).
-pub(crate) fn decode_route_value(value: &[u8]) -> Option<Vec<IpRange>> {
+pub fn decode_route_value(value: &[u8]) -> Option<Vec<IpRange>> {
     let mut ranges = Vec::new();
     let mut buf = value;
 
@@ -312,13 +320,13 @@ pub(crate) fn decode_route_value(value: &[u8]) -> Option<Vec<IpRange>> {
 }
 
 /// Encode a full `ROUTE_ADVERTISEMENT` capsule (TLV + payload).
-pub(crate) fn encode_route_advertisement(ranges: &[IpRange]) -> Bytes {
+pub fn encode_route_advertisement(ranges: &[IpRange]) -> Bytes {
     encode_capsule(CAPSULE_ROUTE_ADVERTISEMENT, &encode_route_value(ranges))
 }
 
 /// Decode a full `ROUTE_ADVERTISEMENT` capsule (TLV + payload), or `None`.
 #[allow(dead_code)]
-pub(crate) fn decode_route_advertisement(capsule: &[u8]) -> Option<Vec<IpRange>> {
+pub fn decode_route_advertisement(capsule: &[u8]) -> Option<Vec<IpRange>> {
     match decode_capsule(capsule) {
         Some((CAPSULE_ROUTE_ADVERTISEMENT, v)) => decode_route_value(&v),
         _ => None,
@@ -330,7 +338,7 @@ pub(crate) fn decode_route_advertisement(capsule: &[u8]) -> Option<Vec<IpRange>>
 // ---------------------------------------------------------------------------
 
 /// Encode `value` as a QUIC variable-length integer (RFC 9000 §16).
-pub(crate) fn put_varint(buf: &mut BytesMut, value: u64) {
+pub fn put_varint(buf: &mut BytesMut, value: u64) {
     match value {
         0x00..=0x3f => buf.put_u8(value as u8),
         0x40..=0x3fff => buf.put_u16((value | 0x4000) as u16),
@@ -340,7 +348,7 @@ pub(crate) fn put_varint(buf: &mut BytesMut, value: u64) {
 }
 
 /// Decode a QUIC variable-length integer from the front of `buf`, advancing it.
-pub(crate) fn get_varint(buf: &mut &[u8]) -> Option<u64> {
+pub fn get_varint(buf: &mut &[u8]) -> Option<u64> {
     let first = *buf.first()?;
     let len = 1 << (first >> 6);
     if buf.len() < len {

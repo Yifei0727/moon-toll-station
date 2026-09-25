@@ -134,6 +134,21 @@ pub struct AppConfig {
 
     #[arg(
         long,
+        value_name = "BYTES",
+        help = "Cap QUIC datagram size when the path has a smaller MTU (avoids blackholed/fragmented handshakes). Applies to the HTTP/3 (QUIC) listener's transport config: the advertised max UDP payload size, the initial MTU and MTU discovery's upper bound are all clamped to this. Must be >= 1200 (the QUIC minimum)."
+    )]
+    pub max_mtu: Option<u16>,
+
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 60,
+        help = "Poll --cert-chain/--key every N seconds and hot-swap the QUIC listener's TLS certificate when the file contents change (symlink-rotation friendly: existing connections keep the old cert). 0 disables polling."
+    )]
+    pub cert_reload_secs: u64,
+
+    #[arg(
+        long,
         value_enum,
         help = "Disable a protocol mode. Currently only 'http', which disables the TCP listener on --listen that serves SOCKS4, SOCKS5 and HTTP CONNECT together (it is NOT an HTTP-only toggle: all three go away). Requires --enable h3, otherwise nothing would be listening."
     )]
@@ -183,6 +198,14 @@ impl AppConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if !self.run_tcp_proxy() && !matches!(self.enable, Some(EnableProtocol::H3)) {
             bail!("--disable http requires --enable h3: nothing would be listening");
+        }
+        if let Some(mtu) = self.max_mtu
+            && mtu < 1200
+        {
+            bail!(
+                "--max-mtu {mtu} is below the QUIC minimum of 1200 bytes; \
+                 smaller values cannot carry the initial handshake packets"
+            );
         }
         Ok(())
     }
@@ -287,5 +310,28 @@ mod tests {
             .validate()
             .expect("default config is valid");
         config_from(H3_ARGS).validate().expect("enable h3 is valid");
+    }
+
+    #[test]
+    fn max_mtu_below_quic_minimum_is_rejected() {
+        let mut args = H3_ARGS.to_vec();
+        args.extend_from_slice(&["--max-mtu", "1199"]);
+        let err = config_from(&args)
+            .validate()
+            .expect_err("1199 is below the QUIC minimum and must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("1200"),
+            "error should mention the 1200-byte QUIC minimum, got: {message}"
+        );
+    }
+
+    #[test]
+    fn max_mtu_at_quic_minimum_is_accepted() {
+        let mut args = H3_ARGS.to_vec();
+        args.extend_from_slice(&["--max-mtu", "1200"]);
+        config_from(&args)
+            .validate()
+            .expect("1200 is the QUIC minimum and must be accepted");
     }
 }

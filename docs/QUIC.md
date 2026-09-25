@@ -160,6 +160,8 @@ auto-server --enable h3 --key xxx.pem --cert-chain xxxfull.chain.pem --h3-bind 0
 | `--cert-chain <PATH>` | PEM certificate chain (fullchain) for the QUIC/HTTP/3 listener. **Required** when `--enable h3`. |
 | `--auth-token <TOKEN>` | Shared secret. **Required** when `--enable h3`. See auth below. |
 | `--h3-bind <ADDR:PORT>` | Full bind address (IP:port) for the QUIC listener. **Optional, default `0.0.0.0:443`.** Independent of `--listen`: the TCP proxy and the MASQUE endpoint each have their own bind address. |
+| `--max-mtu <BYTES>` | Cap the QUIC datagram size when the path has a smaller MTU (avoids blackholed/fragmented handshakes). Must be >= 1200 (the QUIC minimum). See below. |
+| `--cert-reload-secs <SECONDS>` | Poll `--cert-chain`/`--key` every N seconds and hot-swap the TLS certificate when their contents change (symlink rotation friendly). Default 60; `0` disables polling. See below. |
 | `--disable http` | Do not start the TCP listener on `--listen` at all, so **only** MASQUE runs. Optional. Requires `--enable h3`. |
 
 `--listen` is purely the TCP proxy's bind address (SOCKS4/SOCKS5/HTTP CONNECT, default
@@ -190,6 +192,47 @@ Error: --disable http requires --enable h3: nothing would be listening
 
 Auth (`--auth-token`), tunneling and datagram behavior are identical whether or not the TCP
 listener is disabled.
+
+### `--max-mtu <BYTES>` (cap the QUIC datagram size)
+
+QUIC's initial handshake packets are at least 1200 bytes, and quinn's MTU discovery grows the
+datagram size beyond that (default search upper bound 1452). On a path with a smaller MTU those
+large datagrams get silently dropped — the classic "server replies but the client never completes
+the handshake" failure. `--max-mtu` caps all three relevant knobs at once (server and
+`masque-client` accept the same flag; give them the same value):
+
+- `EndpointConfig::max_udp_payload_size` — what we accept and advertise to the peer (quinn default
+  1472);
+- `MtuDiscoveryConfig::upper_bound` — MTU discovery may not grow outgoing datagrams above the cap
+  (it would otherwise, since discovery is bounded by the *peer's* advertised value, not ours);
+- `initial_mtu` is deliberately left at quinn's safe default of 1200: the first handshake packets
+  stay at the QUIC-minimum size instead of being sized up to the cap.
+
+Values below 1200 are rejected at startup: `Error: --max-mtu 1199 is below the QUIC minimum of
+1200 bytes; smaller values cannot carry the initial handshake packets`. When the flag is absent,
+behavior is unchanged (quinn defaults).
+
+### `--cert-reload-secs <SECONDS>` (hot TLS certificate reload)
+
+The deployment updates the TLS certificate + private key by **swapping symlinks**; with this flag
+(default 60, `0` disables polling) a background task re-reads `--cert-chain` and `--key` every N
+seconds and compares the file bytes. On a change it rebuilds the `rustls -> quinn` server config
+(with the same transport settings, including any `--max-mtu` cap) and hot-swaps it via
+`Endpoint::set_server_config` — no restart:
+
+- **New handshakes** use the new certificate immediately; **existing connections keep** the one
+  they were authenticated with (logged as `reloaded TLS certificate ...`).
+- Plain file reads follow symlinks, so pointing the stable paths at new material is all that is
+  needed. Polling (rather than inotify) works on every platform the release CI ships.
+- **Robustness:** a tick that hits an unreadable, half-written or unparseable file (e.g. the key
+  was rotated before the cert) logs a warning and **keeps the old config** — the server never
+  crashes and never serves a broken config; the next tick retries. The quinn-level swap itself is
+  infallible.
+
+Verified by the `#[ignore]`d tests `e2e_cert_reload_rotates_certificate` (rotate A→B; a client
+trusting only B then handshakes, a client trusting only A is rejected) and
+`e2e_cert_reload_tolerates_broken_material` (broken key: warn + keep serving old cert + recover
+on the next tick).
 
 ## Authentication (required)
 
@@ -286,6 +329,15 @@ DATAGRAM + extended-CONNECT settings (otherwise the client handshake fails), and
 flow both ways through the tunnel. Note it generates the self-signed cert with
 `basicConstraints=CA:FALSE` + `extendedKeyUsage=serverAuth` so the client's real webpki verifier
 accepts it as an end-entity.
+
+Related `#[ignore]`d tests in the same module: `e2e_connect_udp_roundtrip_max_mtu` (full
+round-trip with `--max-mtu 1200` on server and client), `e2e_cert_reload_rotates_certificate`
+(certificate A → B symlink rotation; old cert then rejected) and
+`e2e_cert_reload_tolerates_broken_material` (broken key file keeps serving, recovers next tick):
+
+```
+cargo test -- --ignored e2e_connect_udp_roundtrip_max_mtu e2e_cert_reload
+```
 
 ## Limitations
 

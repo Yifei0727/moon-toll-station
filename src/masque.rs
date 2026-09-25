@@ -44,6 +44,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 // Only used by the Linux-only CONNECT-IP helpers below.
 #[cfg(target_os = "linux")]
@@ -65,8 +66,8 @@ use h3_datagram::datagram_handler::{DatagramReader, DatagramSender, HandleDatagr
 use h3_quinn::datagram::{RecvDatagramHandler, SendDatagramHandler};
 use h3_quinn::Connection as H3QuinnConnection;
 use quinn::{
-    crypto::rustls::QuicServerConfig, Connection as QuinnConnection, Endpoint, ServerConfig,
-    TransportConfig,
+    MtuDiscoveryConfig, crypto::rustls::QuicServerConfig, Connection as QuinnConnection, Endpoint,
+    ServerConfig, TransportConfig,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::{
@@ -132,6 +133,170 @@ const MASQUE_IP_PATH: &str = "/.well-known/masque/ip";
 const BASE64_ENGINE: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
 
+/// QUIC's minimum datagram size (RFC 9000 §14): every endpoint must be able to
+/// receive packets of at least 1200 bytes.
+pub const MIN_QUIC_MTU: u16 = 1200;
+
+/// Clamp a quinn endpoint to `max_mtu`. Shared by the QUIC server (via
+/// `--max-mtu`) and `masque-client` (same flag), so both ends of a diagnosis
+/// run behave identically.
+///
+/// quinn 0.11 (`quinn` 0.11.12 + `quinn-proto` 0.11.18) facts this relies on:
+///
+/// * The advertised/accepted UDP payload cap is `EndpointConfig::
+///   max_udp_payload_size` (default 1472 = Ethernet MTU minus IP+UDP headers;
+///   accepted range 1200..=65527). It is NOT a `TransportConfig` knob; it
+///   becomes the `max_udp_payload_size` transport parameter the peer sees and
+///   sizes the endpoint's UDP receive buffers.
+/// * MTU discovery is enabled by default and its search upper bound is
+///   clamped by the *peer's* advertised `max_udp_payload_size`, not by our
+///   own setting — so without capping `MtuDiscoveryConfig::upper_bound`,
+///   discovery would grow outgoing datagrams right back above the cap.
+/// * `TransportConfig::initial_mtu` defaults to 1200, which is already <= any
+///   valid cap, so it is left alone on purpose: the first handshake packets
+///   stay at the safe minimum instead of being sized up to the cap (which
+///   would defeat the point when the path is the bottleneck).
+pub fn apply_max_mtu(
+    transport: &mut TransportConfig,
+    endpoint: &mut quinn::EndpointConfig,
+    max_mtu: u16,
+) -> anyhow::Result<()> {
+    if max_mtu < MIN_QUIC_MTU {
+        anyhow::bail!(
+            "--max-mtu {max_mtu} is below the QUIC minimum of {MIN_QUIC_MTU} bytes; \
+             smaller values cannot carry the initial handshake packets"
+        );
+    }
+    // Caps what we accept and what the peer is told to send us.
+    endpoint
+        .max_udp_payload_size(max_mtu)
+        .map_err(|e| anyhow::anyhow!("invalid --max-mtu {max_mtu}: {e}"))?;
+    // Cap what we *send*: MTU discovery may only search up to the cap.
+    let mut discovery = MtuDiscoveryConfig::default();
+    discovery.upper_bound(max_mtu);
+    transport.mtu_discovery_config(Some(discovery));
+    Ok(())
+}
+
+/// Build a full `quinn::ServerConfig` from the PEM files at `cert_path` /
+/// `key_path` (plain reads — symlinks are followed, which is how the deployed
+/// service rotates material), plus the `EndpointConfig` to bind the listener
+/// with. Used at startup and on every reload tick, so a hot-swapped config is
+/// always rebuilt the same way — including any `--max-mtu` transport caps.
+async fn build_quic_server_config(
+    cert_path: &str,
+    key_path: &str,
+    max_mtu: Option<u16>,
+) -> anyhow::Result<(ServerConfig, quinn::EndpointConfig)> {
+    let certs = load_certs(cert_path).await?;
+    let key = load_key(key_path).await?;
+
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("failed to build rustls ServerConfig from --key/--cert-chain")?;
+    // Allow 0-RTT / early data so MASQUE handshakes can be fast; harmless
+    // for our stateless tunnel.
+    tls.max_early_data_size = u32::MAX;
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic_crypto = QuicServerConfig::try_from(tls)
+        .context("failed to build QUIC crypto config from rustls ServerConfig")?;
+    let mut server_cfg = ServerConfig::with_crypto(Arc::new(quic_crypto));
+
+    let mut tp = TransportConfig::default();
+    // NOTE: `None` DISABLES inbound datagrams — we need them, so pass Some.
+    // There is no `max_datagram_receive_frame_size` in quinn 0.11.
+    tp.datagram_receive_buffer_size(Some(64 * 1024));
+    tp.datagram_send_buffer_size(64 * 1024);
+    let mut endpoint_cfg = quinn::EndpointConfig::default();
+    if let Some(mtu) = max_mtu {
+        apply_max_mtu(&mut tp, &mut endpoint_cfg, mtu)?;
+    }
+    server_cfg.transport_config(Arc::new(tp));
+    Ok((server_cfg, endpoint_cfg))
+}
+
+/// Periodically re-read `--cert-chain` / `--key` and hot-swap the endpoint's
+/// TLS config when the file *contents* changed (symlink rotation, in-place
+/// renewal, ...). Polling, not inotify: cross-platform (release CI ships
+/// Windows/macOS builds) and simple. `File::open` follows symlinks, so the
+/// stable symlink path always resolves to the currently-live material.
+///
+/// Robustness contract: a tick that cannot read/parse/build the new material
+/// (key rotated before cert, half-written file, missing file, ...) logs a
+/// warning and keeps the previous config; the next tick retries. The swap
+/// itself (`Endpoint::set_server_config`) is infallible in quinn 0.11, and
+/// only new handshakes are affected — established connections keep the cert
+/// they were authenticated with.
+async fn run_cert_reloader(
+    endpoint: Endpoint,
+    cert_path: String,
+    key_path: String,
+    interval: Duration,
+    max_mtu: Option<u16>,
+) {
+    // Contents of the material currently loaded into the endpoint: the file
+    // bytes, compared verbatim each tick (no hash needed — the files are a few
+    // KB and this avoids adding a dependency). Seeded with the bytes read at
+    // startup so an unchanged first tick does not rebuild the config.
+    let mut loaded: Option<(Vec<u8>, Vec<u8>)> =
+        match tokio::try_join!(tokio::fs::read(&cert_path), tokio::fs::read(&key_path)) {
+            Ok((cert, key)) => Some((cert, key)),
+            // Startup already validated these files; if they vanished since,
+            // the first tick just treats the material as unknown.
+            Err(_) => None,
+        };
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tick.tick().await;
+        let cert_bytes = match tokio::fs::read(&cert_path).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(cert = %cert_path, error = %e, "cert reload: cannot read --cert-chain; keeping old TLS config");
+                continue;
+            }
+        };
+        let key_bytes = match tokio::fs::read(&key_path).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(key = %key_path, error = %e, "cert reload: cannot read --key; keeping old TLS config");
+                continue;
+            }
+        };
+        if let Some((loaded_cert, loaded_key)) = &loaded
+            && loaded_cert.as_slice() == cert_bytes
+            && loaded_key.as_slice() == key_bytes
+        {
+            continue;
+        }
+
+        match build_quic_server_config(&cert_path, &key_path, max_mtu).await {
+            Ok((server_cfg, _endpoint_cfg)) => {
+                // Infallible in quinn 0.11 (returns ()). Only affects new
+                // handshakes; live connections are untouched.
+                endpoint.set_server_config(Some(server_cfg));
+                loaded = Some((cert_bytes, key_bytes));
+                info!(
+                    cert = %cert_path,
+                    key = %key_path,
+                    "reloaded TLS certificate; new QUIC handshakes use the updated material"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    cert = %cert_path,
+                    key = %key_path,
+                    error = %e,
+                    "cert reload: new TLS material is unusable; keeping old config and retrying next tick"
+                );
+            }
+        }
+    }
+}
+
 /// HTTP/3 MASQUE server. Created from the shared `AppConfig`; runs the QUIC
 /// listener and, for every QUIC connection, an HTTP/3 connection driver plus a
 /// connection-wide datagram demultiplexer.
@@ -156,34 +321,40 @@ impl MasqueServer {
     /// triggered (`shutdown`); every connection task gets a clone so CONNECT-IP
     /// sessions observe the shutdown and tear their tun/NAT state down.
     pub async fn run(self, shutdown: Shutdown) -> anyhow::Result<()> {
-        let certs = load_certs(self.config.cert_chain.as_deref().unwrap()).await?;
-        let key = load_key(self.config.key.as_deref().unwrap()).await?;
+        let cert_path = self.config.cert_chain.as_deref().unwrap().to_string();
+        let key_path = self.config.key.as_deref().unwrap().to_string();
+        let max_mtu = self.config.max_mtu;
 
-        let mut tls = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .context("failed to build rustls ServerConfig from --key/--cert-chain")?;
-        // Allow 0-RTT / early data so MASQUE handshakes can be fast; harmless
-        // for our stateless tunnel.
-        tls.max_early_data_size = u32::MAX;
-        tls.alpn_protocols = vec![b"h3".to_vec()];
-
-        let quic_crypto = QuicServerConfig::try_from(tls)
-            .context("failed to build QUIC crypto config from rustls ServerConfig")?;
-        let mut server_cfg = ServerConfig::with_crypto(Arc::new(quic_crypto));
-
-        let mut tp = TransportConfig::default();
-        // NOTE: `None` DISABLES inbound datagrams — we need them, so pass Some.
-        // There is no `max_datagram_receive_frame_size` in quinn 0.11.
-        tp.datagram_receive_buffer_size(Some(64 * 1024));
-        tp.datagram_send_buffer_size(64 * 1024);
-        server_cfg.transport_config(Arc::new(tp));
+        let (server_cfg, endpoint_cfg) =
+            build_quic_server_config(&cert_path, &key_path, max_mtu).await?;
 
         // Bind the QUIC endpoint to --h3-bind directly; independent of --listen
-        // (which is purely the TCP proxy's bind address).
+        // (which is purely the TCP proxy's bind address). Built via
+        // `Endpoint::new` (rather than `Endpoint::server`) so a `--max-mtu` cap
+        // can be applied to the `EndpointConfig`.
         let addr = self.config.h3_bind;
-        let endpoint = Endpoint::server(server_cfg, addr)
-            .with_context(|| format!("failed to bind MASQUE/QUIC endpoint on {addr}"))?;
+        let socket = std::net::UdpSocket::bind(addr)
+            .with_context(|| format!("failed to bind MASQUE/QUIC socket on {addr}"))?;
+        let endpoint = Endpoint::new(
+            endpoint_cfg,
+            Some(server_cfg),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .with_context(|| format!("failed to start MASQUE/QUIC endpoint on {addr}"))?;
+
+        // Periodic TLS certificate hot-reload (0 disables polling). The endpoint
+        // is internally Arc-shared, so a clone is enough to hand the reloader
+        // task a handle to the same listener. The task dies with the process.
+        if self.config.cert_reload_secs > 0 {
+            tokio::spawn(run_cert_reloader(
+                endpoint.clone(),
+                cert_path,
+                key_path,
+                Duration::from_secs(self.config.cert_reload_secs),
+                max_mtu,
+            ));
+        }
 
         info!(listen = %addr, "masque (HTTP/3 CONNECT-UDP) server started");
 
@@ -1363,15 +1534,52 @@ async fn load_key(path: &str) -> anyhow::Result<PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_proxy_auth, is_connect_ip_path, parse_target, validate_connect_ip,
+        apply_max_mtu, check_proxy_auth, is_connect_ip_path, parse_target, validate_connect_ip,
         validate_tcp_connect, validate_connect_udp,
     };
     use base64::Engine;
     use crate::server::{Host, parse_authority};
     use h3::ext::Protocol;
     use http::{HeaderValue, Method, Request, Uri};
+    use quinn::{EndpointConfig as TestEndpointConfig, TransportConfig as TestTransportConfig};
     use std::str::FromStr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// `--max-mtu` must actually land in the configs quinn is handed: the
+    /// endpoint's advertised/accepted `max_udp_payload_size` becomes the cap
+    /// (default is 1472), and the transport-level MTU-discovery upper bound is
+    /// capped too (there is no public getter for it, but the setter only
+    /// accepts values that would be used).
+    #[test]
+    fn max_mtu_is_carried_by_the_quinn_configs() {
+        let mut tp = TestTransportConfig::default();
+        let mut ec = TestEndpointConfig::default();
+        assert_eq!(ec.get_max_udp_payload_size(), 1472, "quinn default");
+
+        apply_max_mtu(&mut tp, &mut ec, 1200).expect("1200 is the QUIC minimum");
+        assert_eq!(
+            ec.get_max_udp_payload_size(),
+            1200,
+            "--max-mtu must reach EndpointConfig::max_udp_payload_size"
+        );
+    }
+
+    /// Values below RFC 9000 §14's 1200-byte minimum are rejected before any
+    /// config is mutated.
+    #[test]
+    fn max_mtu_below_quic_minimum_is_rejected() {
+        let mut tp = TestTransportConfig::default();
+        let mut ec = TestEndpointConfig::default();
+        assert!(
+            apply_max_mtu(&mut tp, &mut ec, 1199).is_err(),
+            "1199 must be rejected"
+        );
+        assert_eq!(
+            ec.get_max_udp_payload_size(),
+            1472,
+            "a rejected cap must leave the endpoint config untouched"
+        );
+    }
 
     /// Proxy authority used by the tests. Per RFC 9298 it is *our* address, not
     /// the target's.
@@ -2025,7 +2233,7 @@ mod e2e {
     use std::str::FromStr;
     use std::time::Duration;
 
-    use anyhow::anyhow;
+    use anyhow::{Context as _, anyhow};
     use bytes::{Buf, Bytes};
     use clap::Parser;
     use http::{HeaderValue, Method, Request, StatusCode};
@@ -2365,8 +2573,17 @@ mod e2e {
     /// temp dir. Returns `(key_path, cert_path)`. Returns `None` if openssl is
     /// unavailable.
     fn gen_cert() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        gen_cert_in("main")
+    }
+
+    /// Like [`gen_cert`], but into its own named subdirectory so several
+    /// independent certificates can coexist within one test run (cert rotation).
+    fn gen_cert_in(name: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         let openssl = which("openssl")?;
-        let dir = std::env::temp_dir().join(format!("auto-server-masque-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "auto-server-masque-{}-{name}",
+            std::process::id()
+        ));
         let _ = std::fs::create_dir_all(&dir);
         let key = dir.join("key.pem");
         let cert = dir.join("cert.pem");
@@ -3150,6 +3367,406 @@ mod e2e {
         drop(send_request);
         drop(h3_conn);
         endpoint.close(0u32.into(), b"test done");
+        server_handle.abort();
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // Shared helpers for the cert-reload / MTU e2e tests below.
+    // -------------------------------------------------------------------
+
+    type H3ClientConn = h3::client::Connection<H3QuinnConnection, Bytes>;
+    type H3ReqSender = h3::client::SendRequest<
+        <H3QuinnConnection as h3::quic::Connection<Bytes>>::OpenStreams,
+        Bytes,
+    >;
+
+    /// Make `link` resolve to `target`. On unix this is a real symlink — the
+    /// production rotation mechanism (plain reads follow it). Elsewhere the
+    /// content is copied over the link path, which triggers the same
+    /// content-change detection in the reloader.
+    #[cfg(unix)]
+    fn install_material(link: &std::path::Path, target: &std::path::Path) -> anyhow::Result<()> {
+        let _ = std::fs::remove_file(link);
+        std::os::unix::fs::symlink(target, link)
+            .with_context(|| format!("symlink {} -> {}", link.display(), target.display()))
+    }
+
+    /// Non-unix fallback: copy the material over the stable path.
+    #[cfg(not(unix))]
+    fn install_material(link: &std::path::Path, target: &std::path::Path) -> anyhow::Result<()> {
+        std::fs::copy(target, link).with_context(|| {
+            format!("copy {} over {}", target.display(), link.display())
+        })?;
+        Ok(())
+    }
+
+    /// A `RootCertStore` trusting ONLY the leaf cert(s) in `pem` — used to
+    /// prove which certificate a handshake was actually accepted with.
+    fn roots_for(pem: &std::path::Path) -> anyhow::Result<RootCertStore> {
+        let bytes = std::fs::read(pem)?;
+        let mut reader = Cursor::new(bytes);
+        let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<_, _>>()
+            .map_err(|e| anyhow!("parse {}: {e}", pem.display()))?;
+        let mut roots = RootCertStore::empty();
+        for c in certs {
+            roots
+                .add(c)
+                .map_err(|e| anyhow!("add anchor from {}: {e}", pem.display()))?;
+        }
+        Ok(roots)
+    }
+
+    /// Start a local UDP echo server; datagrams sent to it come back verbatim.
+    async fn spawn_udp_echo() -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        let sock = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = sock.local_addr()?;
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                let _ = sock.send_to(&buf[..n], from).await;
+            }
+        });
+        Ok((addr, handle))
+    }
+
+    /// Start the real `MasqueServer` on `udp_port` with the given key/cert
+    /// paths plus `extra` CLI args (e.g. `--cert-reload-secs`, `--max-mtu`).
+    fn spawn_masque_server(
+        key: &std::path::Path,
+        cert: &std::path::Path,
+        udp_port: u16,
+        extra: &[&str],
+    ) -> tokio::task::JoinHandle<()> {
+        let mut args = vec![
+            "auto-server".to_string(),
+            "--listen".into(),
+            "127.0.0.1:0".into(),
+            "--enable".into(),
+            "h3".into(),
+            "--key".into(),
+            key.to_string_lossy().into_owned(),
+            "--cert-chain".into(),
+            cert.to_string_lossy().into_owned(),
+            "--auth-token".into(),
+            TOKEN.into(),
+            "--h3-bind".into(),
+            format!("127.0.0.1:{udp_port}"),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let cli = Cli::parse_from(arg_refs);
+        let server = MasqueServer::new(cli.config).expect("valid server config");
+        tokio::spawn(async move {
+            let _ = server.run(crate::shutdown::Shutdown::new()).await;
+        })
+    }
+
+    /// Connect a fresh quinn + h3 client trusting exactly `roots`, with up to
+    /// `attempts` handshake attempts (so the first connection can wait for the
+    /// listener to bind; later checks pass `1` to get honest failures).
+    async fn h3_connect(
+        roots: RootCertStore,
+        server_addr: SocketAddr,
+        name: &str,
+        attempts: usize,
+        max_mtu: Option<u16>,
+    ) -> anyhow::Result<(Endpoint, H3ClientConn, H3ReqSender)> {
+        let mut client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls)
+            .map_err(|e| anyhow!("quic client crypto: {e}"))?;
+        let mut client_cfg = ClientConfig::new(Arc::new(quic_crypto));
+        let mut tp = TransportConfig::default();
+        tp.datagram_receive_buffer_size(Some(64 * 1024));
+        let mut endpoint_cfg = quinn::EndpointConfig::default();
+        if let Some(mtu) = max_mtu {
+            super::apply_max_mtu(&mut tp, &mut endpoint_cfg, mtu)?;
+        }
+        client_cfg.transport_config(Arc::new(tp));
+
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let mut endpoint = Endpoint::new(
+            endpoint_cfg,
+            None,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?;
+        endpoint.set_default_client_config(client_cfg);
+
+        let mut last_err: Option<String> = None;
+        for _ in 0..attempts {
+            match endpoint.connect(server_addr, name) {
+                Ok(connecting) => match connecting.await {
+                    Ok(conn) => {
+                        let mut builder = h3::client::builder();
+                        builder.enable_datagram(true);
+                        builder.enable_extended_connect(true);
+                        let (h3, send_request) = builder
+                            .build(H3QuinnConnection::new(conn))
+                            .await
+                            .map_err(|e| anyhow!("h3 client: {e}"))?;
+                        return Ok((endpoint, h3, send_request));
+                    }
+                    Err(e) => last_err = Some(format!("handshake: {e}")),
+                },
+                Err(e) => return Err(anyhow!("connect: {e}")),
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Err(anyhow!(
+            "no QUIC handshake with {server_addr}: {}",
+            last_err.unwrap_or_else(|| "exhausted attempts".into())
+        ))
+    }
+
+    /// One complete CONNECT-UDP round-trip against `echo_addr` through a fresh
+    /// tunnel on `h3` — the minimal proof that a handshake was accepted AND the
+    /// data plane works.
+    async fn udp_echo_roundtrip(
+        h3: &H3ClientConn,
+        send_request: &mut H3ReqSender,
+        proxy_port: u16,
+        echo_addr: SocketAddr,
+    ) -> anyhow::Result<()> {
+        let mut req = Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!(
+                "https://localhost:{proxy_port}/.well-known/masque/udp/127.0.0.1/{}/",
+                echo_addr.port()
+            ))
+            .body(())
+            .expect("valid CONNECT-UDP request");
+        req.headers_mut()
+            .insert("capsule-protocol", HeaderValue::from_static("?1"));
+        req.headers_mut().insert(
+            "proxy-authorization",
+            HeaderValue::from_str(&format!("Bearer {TOKEN}")).expect("auth header"),
+        );
+        req.extensions_mut().insert(Protocol::CONNECT_UDP);
+
+        let mut stream = send_request
+            .send_request(req)
+            .await
+            .map_err(|e| anyhow!("send_request: {e}"))?;
+        let resp = stream
+            .recv_response()
+            .await
+            .map_err(|e| anyhow!("recv_response: {e}"))?;
+        anyhow::ensure!(
+            resp.status() == StatusCode::OK,
+            "CONNECT-UDP returned {}",
+            resp.status()
+        );
+
+        let stream_id = stream.id();
+        let mut sender = h3.get_datagram_sender(stream_id);
+        let mut reader = h3.get_datagram_reader();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+        tokio::spawn(async move {
+            while let Ok(d) = reader.read_datagram().await {
+                if tx.send(d.into_payload()).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let payload = b"masque-reload-e2e";
+        let mut dgram = Vec::with_capacity(1 + payload.len());
+        dgram.push(0x00);
+        dgram.extend_from_slice(payload);
+        sender
+            .send_datagram(Bytes::from(dgram))
+            .map_err(|e| anyhow!("send_datagram: {e}"))?;
+        let got = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .map_err(|_| anyhow!("no echoed datagram"))?
+            .ok_or_else(|| anyhow!("datagram channel closed"))?;
+        anyhow::ensure!(
+            got.len() == 1 + payload.len() && &got[1..] == payload,
+            "echoed payload mismatch: {} bytes",
+            got.len()
+        );
+        Ok(())
+    }
+
+    /// End-to-end **TLS certificate hot-reload** (symlink rotation, the
+    /// production mechanism). Proves that after the reload tick a new handshake
+    /// is accepted only under the NEW certificate: a client trusting cert B
+    /// succeeds while a client still trusting only cert A is rejected.
+    #[tokio::test]
+    #[ignore = "requires openssl; run: cargo test -- --ignored e2e_cert_reload_rotates_certificate"]
+    async fn e2e_cert_reload_rotates_certificate() -> anyhow::Result<()> {
+        let _ = ring::default_provider().install_default();
+        let Some((key_a, cert_a)) = gen_cert_in("rot-a") else {
+            eprintln!("openssl not available; skipping cert-rotation e2e");
+            return Ok(());
+        };
+        let Some((key_b, cert_b)) = gen_cert_in("rot-b") else {
+            eprintln!("openssl not available; skipping cert-rotation e2e");
+            return Ok(());
+        };
+
+        // Stable paths the server watches; initially rotated to material A.
+        let dir = std::env::temp_dir().join(format!("auto-server-masque-rot-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let live_key = dir.join("live.key.pem");
+        let live_cert = dir.join("live.cert.pem");
+        install_material(&live_key, &key_a)?;
+        install_material(&live_cert, &cert_a)?;
+
+        let udp_port = free_udp_port();
+        let server_handle = spawn_masque_server(
+            &live_key,
+            &live_cert,
+            udp_port,
+            &["--cert-reload-secs", "1"],
+        );
+        let (echo_addr, _echo) = spawn_udp_echo().await?;
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), udp_port);
+
+        // Phase 1: a client trusting A handshakes and round-trips a datagram.
+        {
+            let roots = roots_for(&cert_a)?;
+            let (endpoint, h3, mut send_request) =
+                h3_connect(roots, server_addr, "localhost", 100, None).await?;
+            udp_echo_roundtrip(&h3, &mut send_request, udp_port, echo_addr).await?;
+            endpoint.close(0u32.into(), b"phase 1 done");
+        }
+
+        // Phase 2: rotate the symlinks to material B; wait for the reload tick.
+        install_material(&live_key, &key_b)?;
+        install_material(&live_cert, &cert_b)?;
+        // Reload poll is 1s; allow two ticks plus build margin.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        // Phase 3: a client trusting ONLY B must now succeed (swap took effect).
+        {
+            let roots = roots_for(&cert_b)?;
+            let (endpoint, h3, mut send_request) =
+                h3_connect(roots, server_addr, "localhost", 100, None).await?;
+            udp_echo_roundtrip(&h3, &mut send_request, udp_port, echo_addr).await?;
+            endpoint.close(0u32.into(), b"phase 3 done");
+        }
+
+        // Phase 4: a client still trusting ONLY A must now FAIL verification.
+        {
+            let roots = roots_for(&cert_a)?;
+            let result = h3_connect(roots, server_addr, "localhost", 1, None).await;
+            assert!(
+                result.is_err(),
+                "handshake under the old (rotated-out) certificate must fail"
+            );
+        }
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    /// End-to-end **reload resilience**: a deliberately broken key file must
+    /// NOT take the server down or break existing service — it logs a warning
+    /// and keeps serving the old material; the next tick after the files are
+    /// valid again completes the rotation.
+    #[tokio::test]
+    #[ignore = "requires openssl; run: cargo test -- --ignored e2e_cert_reload_tolerates_broken_material"]
+    async fn e2e_cert_reload_tolerates_broken_material() -> anyhow::Result<()> {
+        let _ = ring::default_provider().install_default();
+        let Some((key_a, cert_a)) = gen_cert_in("bad-a") else {
+            eprintln!("openssl not available; skipping reload-resilience e2e");
+            return Ok(());
+        };
+        let Some((key_b, cert_b)) = gen_cert_in("bad-b") else {
+            eprintln!("openssl not available; skipping reload-resilience e2e");
+            return Ok(());
+        };
+
+        let dir = std::env::temp_dir().join(format!("auto-server-masque-bad-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let live_key = dir.join("live.key.pem");
+        let live_cert = dir.join("live.cert.pem");
+        install_material(&live_key, &key_a)?;
+        install_material(&live_cert, &cert_a)?;
+
+        let udp_port = free_udp_port();
+        let server_handle = spawn_masque_server(
+            &live_key,
+            &live_cert,
+            udp_port,
+            &["--cert-reload-secs", "1"],
+        );
+        let (echo_addr, _echo) = spawn_udp_echo().await?;
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), udp_port);
+
+        // Baseline: material A serves fine.
+        {
+            let roots = roots_for(&cert_a)?;
+            let (endpoint, h3, mut send_request) =
+                h3_connect(roots, server_addr, "localhost", 100, None).await?;
+            udp_echo_roundtrip(&h3, &mut send_request, udp_port, echo_addr).await?;
+            endpoint.close(0u32.into(), b"baseline done");
+        }
+
+        // Break the key: replace the symlink with a half-written (garbage) file.
+        let _ = std::fs::remove_file(&live_key);
+        std::fs::write(&live_key, b"-----BEGIN NOT A KEY-----\ngarbage\n")?;
+        // One full tick to make sure the reloader sees (and rejects) it.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // The server must still be serving under the OLD cert.
+        {
+            let roots = roots_for(&cert_a)?;
+            let (endpoint, h3, mut send_request) =
+                h3_connect(roots, server_addr, "localhost", 100, None).await?;
+            udp_echo_roundtrip(&h3, &mut send_request, udp_port, echo_addr).await?;
+            endpoint.close(0u32.into(), b"broken-phase done");
+        }
+
+        // Recover: rotate to valid material B; the next tick must pick it up.
+        install_material(&live_key, &key_b)?;
+        install_material(&live_cert, &cert_b)?;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        {
+            let roots = roots_for(&cert_b)?;
+            let (endpoint, h3, mut send_request) =
+                h3_connect(roots, server_addr, "localhost", 100, None).await?;
+            udp_echo_roundtrip(&h3, &mut send_request, udp_port, echo_addr).await?;
+            endpoint.close(0u32.into(), b"recovered done");
+        }
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    /// End-to-end CONNECT-UDP round-trip with `--max-mtu 1200` on BOTH the
+    /// server and the client — proves the MTU cap does not blackhole the
+    /// handshake or the data plane at the QUIC-minimum datagram size.
+    #[tokio::test]
+    #[ignore = "requires openssl; run: cargo test -- --ignored e2e_connect_udp_roundtrip_max_mtu"]
+    async fn e2e_connect_udp_roundtrip_max_mtu() -> anyhow::Result<()> {
+        let _ = ring::default_provider().install_default();
+        let Some((key, cert)) = gen_cert_in("mtu") else {
+            eprintln!("openssl not available; skipping max-mtu e2e");
+            return Ok(());
+        };
+
+        let udp_port = free_udp_port();
+        let server_handle = spawn_masque_server(
+            &key,
+            &cert,
+            udp_port,
+            &["--max-mtu", "1200"],
+        );
+        let (echo_addr, _echo) = spawn_udp_echo().await?;
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), udp_port);
+
+        let roots = roots_for(&cert)?;
+        let (endpoint, h3, mut send_request) =
+            h3_connect(roots, server_addr, "localhost", 100, Some(1200)).await?;
+        udp_echo_roundtrip(&h3, &mut send_request, udp_port, echo_addr).await?;
+        endpoint.close(0u32.into(), b"max-mtu e2e done");
         server_handle.abort();
         Ok(())
     }

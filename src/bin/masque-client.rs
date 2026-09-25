@@ -20,10 +20,12 @@
 //!
 //! Two important honesty notes:
 //!
-//! * **Certificate trust.** There is deliberately no `--insecure`. Self-signed
-//!   test certificates are trusted by passing them to `--ca` (repeatable), which
-//!   adds them to a real webpki root store — no custom verifier, no disabled
-//!   checks. Adding certificate pinning bypass would require enabling rustls'
+//! * **Certificate trust.** The client trusts the operating system's
+//!   certificate store by default. `--ca` (repeatable) adds extra anchors on
+//!   top of that, which is how self-signed test certificates are trusted.
+//!   There is deliberately no `--insecure`: verification always runs against a
+//!   real webpki root store — no custom verifier, no disabled checks. Adding
+//!   certificate pinning bypass would require enabling rustls'
 //!   `dangerous_configuration` feature purely for this tool.
 //! * **Not independent interop.** This client reuses the server's own
 //!   `capsule` codec, so a green run proves round-trip behaviour, not
@@ -128,9 +130,9 @@ struct Common {
     #[arg(long, value_name = "TOKEN")]
     token: Option<String>,
 
-    /// PEM file whose certificates are added to the verification root store.
-    /// Repeatable. There is no --insecure: pass the server's self-signed cert
-    /// here instead (see docs/masque-client.md).
+    /// PEM file whose certificates are added as *extra* trust anchors on top
+    /// of the OS certificate store (the default root of trust). Repeatable.
+    /// Needed for self-signed / private-CA deployments. There is no --insecure.
     #[arg(long = "ca", value_name = "PEM")]
     ca: Vec<PathBuf>,
 
@@ -139,6 +141,14 @@ struct Common {
     /// certificate (the throwaway certs used in testing use `localhost`).
     #[arg(long, value_name = "NAME")]
     server_name: Option<String>,
+
+    /// Cap QUIC datagram size when the path has a smaller MTU (avoids
+    /// blackholed/fragmented handshakes). Applied to this client's transport
+    /// config (advertised max payload, initial MTU and MTU-discovery upper
+    /// bound). Must be >= 1200 (the QUIC minimum). Use the same value the
+    /// server was started with.
+    #[arg(long, value_name = "BYTES")]
+    max_mtu: Option<u16>,
 
     /// Overall budget for the whole run, in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 15_000)]
@@ -268,6 +278,14 @@ async fn main() -> ExitCode {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
     let cli = Cli::parse();
+    if let Some(mtu) = cli.common.max_mtu
+        && mtu < 1200
+    {
+        eprintln!(
+            "RESULT: FAIL\n      reason: --max-mtu {mtu} is below the QUIC minimum of 1200 bytes"
+        );
+        return ExitCode::FAILURE;
+    }
     let budget = Duration::from_millis(cli.common.timeout_ms);
 
     match tokio::time::timeout(budget, dispatch(cli)).await {
@@ -319,7 +337,12 @@ impl Proxy {
     /// Open a QUIC connection to `server` (verified as `name`) and complete the
     /// HTTP/3 handshake with the two SETTINGS every MASQUE mode needs:
     /// DATAGRAM (RFC 9297) and extended CONNECT (RFC 8441 §4).
-    async fn connect(server: SocketAddr, name: &str, roots: RootCertStore) -> anyhow::Result<Self> {
+    async fn connect(
+        server: SocketAddr,
+        name: &str,
+        roots: RootCertStore,
+        max_mtu: Option<u16>,
+    ) -> anyhow::Result<Self> {
         let mut client_tls = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -333,6 +356,12 @@ impl Proxy {
         // which CONNECT-UDP / CONNECT-IP have no downlink.
         tp.datagram_receive_buffer_size(Some(64 * 1024));
         tp.datagram_send_buffer_size(64 * 1024);
+        // Built via `Endpoint::new` (rather than `Endpoint::client`) so a
+        // `--max-mtu` cap can be applied to the `EndpointConfig` as well.
+        let mut endpoint_cfg = quinn::EndpointConfig::default();
+        if let Some(mtu) = max_mtu {
+            auto_server::masque::apply_max_mtu(&mut tp, &mut endpoint_cfg, mtu)?;
+        }
         client_cfg.transport_config(Arc::new(tp));
 
         let bind: SocketAddr = if server.is_ipv4() {
@@ -342,8 +371,10 @@ impl Proxy {
         }
         .parse()
         .expect("static bind address parses");
-        let mut endpoint =
-            Endpoint::client(bind).with_context(|| format!("failed to bind QUIC client on {bind}"))?;
+        let socket = std::net::UdpSocket::bind(bind)
+            .with_context(|| format!("failed to bind QUIC client on {bind}"))?;
+        let mut endpoint = Endpoint::new(endpoint_cfg, None, socket, Arc::new(quinn::TokioRuntime))
+            .with_context(|| format!("failed to start QUIC client on {bind}"))?;
         endpoint.set_default_client_config(client_cfg);
 
         // Retry briefly so a script that starts the server and the client
@@ -388,17 +419,31 @@ impl Proxy {
     }
 }
 
-/// Load every `--ca` PEM into a webpki root store. At least one CA is required
-/// by design: there is no certificate-verification bypass.
+/// Build the verification root store. The operating system's certificate store
+/// is the default trust root; every `--ca` PEM is added on top as an extra
+/// anchor (for self-signed / private-CA deployments). Only if the combined
+/// store ends up empty do we bail: there is no certificate-verification bypass.
 fn load_roots(cas: &[PathBuf]) -> anyhow::Result<RootCertStore> {
-    if cas.is_empty() {
-        bail!(
-            "no trust anchor: pass --ca <server-cert.pem> (repeatable).\n      \
-             This client has no --insecure flag on purpose; see docs/masque-client.md."
-        );
-    }
     let mut roots = RootCertStore::empty();
-    let mut loaded = 0usize;
+
+    // System anchors first (honours SSL_CERT_FILE / SSL_CERT_DIR). Certificates
+    // that fail to parse as anchors are skipped: one odd entry in the OS store
+    // must not break the client, and store-load errors are reported, not fatal.
+    let system = rustls_native_certs::load_native_certs();
+    for error in &system.errors {
+        info(&format!("system certificate store: {error}"));
+    }
+    let mut system_count = 0usize;
+    for cert in system.certs {
+        if roots.add(cert).is_ok() {
+            system_count += 1;
+        }
+    }
+    info(&format!("loaded {system_count} system trust anchor(s)"));
+
+    // --ca PEMs are additive extra anchors. Files the user named explicitly
+    // stay hard errors if they cannot be read, parsed or added.
+    let mut ca_count = 0usize;
     for path in cas {
         let mut reader = std::io::BufReader::new(
             std::fs::File::open(path)
@@ -414,10 +459,17 @@ fn load_roots(cas: &[PathBuf]) -> anyhow::Result<RootCertStore> {
             roots
                 .add(cert)
                 .with_context(|| format!("failed to add {} as a trust anchor", path.display()))?;
-            loaded += 1;
+            ca_count += 1;
         }
     }
-    info(&format!("loaded {loaded} trust anchor(s) from --ca"));
+    info(&format!("loaded {ca_count} trust anchor(s) from --ca"));
+
+    if roots.is_empty() {
+        bail!(
+            "no trust anchors: the OS certificate store was empty and no --ca was given.\n      \
+             This client has no --insecure flag on purpose; see docs/masque-client.md."
+        );
+    }
     Ok(roots)
 }
 
@@ -499,7 +551,7 @@ async fn run_udp(common: &Common, args: UdpArgs) -> anyhow::Result<()> {
     let mut proxy = check("handshake (QUIC + HTTP/3)", async {
         let (addr, name) = resolve_proxy(common).await?;
         detail(&format!("connected to {addr}, server name '{name}'"));
-        Proxy::connect(addr, &name, roots).await
+        Proxy::connect(addr, &name, roots, common.max_mtu).await
     })
     .await?;
 
@@ -638,7 +690,7 @@ async fn run_tunnel(common: &Common, args: TunnelArgs, protocol: Option<Protocol
     let mut proxy = check("handshake (QUIC + HTTP/3)", async {
         let (addr, name) = resolve_proxy(common).await?;
         detail(&format!("connected to {addr}, server name '{name}'"));
-        Proxy::connect(addr, &name, roots).await
+        Proxy::connect(addr, &name, roots, common.max_mtu).await
     })
     .await?;
 
@@ -739,7 +791,7 @@ async fn run_ip(common: &Common, args: IpArgs) -> anyhow::Result<()> {
     let mut proxy = check("handshake (QUIC + HTTP/3)", async {
         let (addr, name) = resolve_proxy(common).await?;
         detail(&format!("connected to {addr}, server name '{name}'"));
-        Proxy::connect(addr, &name, roots).await
+        Proxy::connect(addr, &name, roots, common.max_mtu).await
     })
     .await?;
 
@@ -1160,4 +1212,91 @@ fn parse_hex(s: &str) -> anyhow::Result<Vec<u8>> {
                 .with_context(|| format!("not hex: '{}'", &compact[i..i + 2]))
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Generate a throwaway self-signed CA cert with openssl (the same tool the
+    /// e2e tests use). Returns `None` to skip cert-dependent scenarios when
+    /// openssl is unavailable.
+    fn gen_ca(dir: &std::path::Path) -> Option<PathBuf> {
+        let key = dir.join("test-ca.key.pem");
+        let cert = dir.join("test-ca.cert.pem");
+        let ok = std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                key.to_str()?,
+                "-out",
+                cert.to_str()?,
+                "-days",
+                "1",
+                "-subj",
+                "/CN=masque-client-test-ca",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?
+            .success();
+        ok.then_some(cert)
+    }
+
+    /// `load_roots` merges the "system" store (pinned via SSL_CERT_FILE /
+    /// SSL_CERT_DIR, which rustls-native-certs honours) with `--ca` PEMs, and
+    /// only bails when the combined store is empty.
+    ///
+    /// Env vars are mutated, so this must not run in parallel with anything
+    /// else that touches them — it is the only test in this binary.
+    #[test]
+    fn load_roots_merges_system_store_and_ca_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty_file = dir.path().join("empty.pem");
+        std::fs::write(&empty_file, "").expect("write empty pem");
+        let empty_dir = dir.path().join("empty-dir");
+        std::fs::create_dir(&empty_dir).expect("mkdir");
+        let ca = gen_ca(dir.path());
+
+        // SAFETY: single test thread mutates these; nothing else in this
+        // binary's test suite reads them.
+        unsafe {
+            std::env::set_var("SSL_CERT_FILE", &empty_file);
+            std::env::set_var("SSL_CERT_DIR", &empty_dir);
+        }
+
+        // Empty "system" store and no --ca: the combined store is empty -> bail.
+        assert!(load_roots(&[]).is_err(), "empty system + no --ca must bail");
+
+        // A --ca PEM alone is enough, and lands in the store.
+        if let Some(ca) = &ca {
+            let roots = load_roots(std::slice::from_ref(ca)).expect("--ca alone must load");
+            assert_eq!(roots.len(), 1, "--ca anchor missing from the store");
+        }
+
+        // The "system" store alone is enough: point SSL_CERT_FILE at the CA.
+        if let Some(ca) = &ca {
+            unsafe { std::env::set_var("SSL_CERT_FILE", ca) };
+            let roots = load_roots(&[]).expect("system store alone must load");
+            assert_eq!(roots.len(), 1, "system anchor missing from the store");
+
+            // Merge: the same anchor via both paths -> two entries, no bail.
+            let roots = load_roots(std::slice::from_ref(ca)).expect("merge must load");
+            assert_eq!(roots.len(), 2, "system + --ca anchors must coexist");
+        }
+
+        unsafe {
+            std::env::remove_var("SSL_CERT_FILE");
+            std::env::remove_var("SSL_CERT_DIR");
+        }
+    }
 }

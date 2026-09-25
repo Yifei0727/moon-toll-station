@@ -1,7 +1,6 @@
 # `masque-client` — end-to-end client for the MASQUE listener
 
-`masque-client` is a **standalone binary** (built from `src/bin/masque-client.rs`, so no
-`Cargo.toml` change is needed) that exercises every protocol `auto-server --enable h3`
+`masque-client` is a **standalone binary** (built from `src/bin/masque-client.rs`) that exercises every protocol `auto-server --enable h3`
 serves from its single HTTP/3 listener. Use it to verify a running server instead of
 hand-writing QUIC clients or reading logs.
 
@@ -19,8 +18,9 @@ Common options (all modes):
 |------|---------|
 | `--proxy <host:port>` | **required.** MASQUE proxy to connect to (the server's `--h3-bind`). |
 | `--token <TOKEN>` | sent as `Proxy-Authorization: Bearer <TOKEN>`. Mandatory if the server was started with `--auth-token`. |
-| `--ca <pem>` | **repeatable.** Adds PEM certificates to the client's webpki root store. See *Trust* below. |
+| `--ca <pem>` | **repeatable, optional.** Adds PEM certificates as *extra* trust anchors on top of the OS certificate store (the default root of trust). See *Trust* below. |
 | `--server-name <name>` | TLS server name / QUIC SNI. Defaults to the host part of `--proxy`; must match a SAN in the server certificate. |
+| `--max-mtu <bytes>` | Cap QUIC datagram size when the path has a smaller MTU (avoids blackholed/fragmented handshakes). Must be >= 1200; use the same value the server was started with. See below. |
 | `--timeout-ms <ms>` | budget for the whole run (default 15000). Non-zero exit on expiry. |
 
 Subcommands:
@@ -53,15 +53,50 @@ RESULT: PASS
 ```
 
 Negative cases were also verified explicitly: a wrong (or missing) token yields
-`407 Proxy Authentication Required` and running with no `--ca` fails immediately with
-"no trust anchor", both exiting `1`.
+`407 Proxy Authentication Required` (exit `1`), and a server whose certificate is not
+trusted (e.g. self-signed, run with no `--ca`) fails the handshake with a certificate
+verification error (exit `1`) — the OS store is loaded, so "no trust anchor" only happens
+if the OS store is empty *and* no `--ca` was given.
 
-### Trust: no `--insecure`, by design
+### `--max-mtu <bytes>` (diagnosing small-MTU paths)
 
-There is deliberately **no certificate-verification bypass**. Self-signed test certificates
-are trusted by pointing `--ca` at the server's PEM, which goes into a real
-`rustls::RootCertStore` — no custom verifier, no disabled checks. Adding `--insecure` would
-require enabling rustls' `dangerous_configuration` feature only for this tool.
+QUIC datagrams grow with path-MTU discovery (quinn default upper bound 1452, plus a 1472-byte
+advertised receive limit). On a path with a smaller MTU those large datagrams are silently
+dropped — the classic "handshake times out although the server replies" failure.
+`--max-mtu <bytes>` caps the client's advertised `max_udp_payload_size` and MTU-discovery upper
+bound at `<bytes>`; `masque-client` and the server accept the identical flag, so a diagnosis run
+just passes the same value to both:
+
+```bash
+masque-client --proxy <host:port> --ca cert.pem --token "$TOKEN" \
+  --max-mtu 1200 udp --target 127.0.0.1:43001
+```
+
+Values below 1200 (the RFC 9000 §14 minimum) are rejected before any connection is attempted.
+If the round-trip passes with `--max-mtu 1200` but fails (or times out) without it, the path
+MTU is the prime suspect.
+
+### Trust: OS store by default, `--ca` adds extras, no `--insecure`
+
+By default the client trusts the **operating system's certificate store** (via
+`rustls-native-certs`; honours `SSL_CERT_FILE` / `SSL_CERT_DIR`). A proxy with a
+certificate from a standard CA (Let's Encrypt, a corporate root in the system store, ...)
+needs no flags at all.
+
+`--ca <pem>` (repeatable) adds extra anchors **on top of** the system store — this is how
+self-signed test certificates and private CAs are trusted:
+
+```bash
+masque-client --proxy 127.0.0.1:4433 --server-name localhost \
+  --ca /tmp/masque-verify/cert.pem --token test-masque-token udp --target 127.0.0.1:43001
+```
+
+There is deliberately **no certificate-verification bypass**. Every anchor — system or
+`--ca` — goes into a real `rustls::RootCertStore`; there is no custom verifier and no
+disabled check. The client only bails up front with "no trust anchors: the OS certificate
+store was empty and no --ca was given" when the combined store would be empty. Adding
+`--insecure` would require enabling rustls' `dangerous_configuration` feature only for
+this tool, and that absence is permanent by design.
 
 > **Not an independent conformance check.** `masque-client` reuses the server's own
 > `auto_server::capsule` codec, so a green run proves that the server works end-to-end — it

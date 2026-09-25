@@ -437,7 +437,10 @@ or other tunnels.
 `TunDevice` owns every side effect it creates behind a `Drop` impl: on tunnel close (control stream
 finished, connection dropped, or the task panicking) it deletes the tun interface, removes its
 `iptables`/`ip route` rules, and releases its hold on the forwarded-flag refcount. Interface names
-use the kernel's `auto%d` auto-naming template so concurrent tunnels never collide.
+use the kernel's `auto%d` auto-naming template so concurrent tunnels never collide. On SIGTERM or
+SIGINT (Ctrl-C) the server stops accepting and waits (bounded) for live CONNECT-IP sessions to run
+this teardown before exiting; **SIGKILL cannot be handled** and will leave the interface and rules
+behind.
 
 ### Data plane
 

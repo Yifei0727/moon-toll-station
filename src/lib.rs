@@ -4,6 +4,7 @@ pub mod logging;
 pub mod masque;
 pub mod server;
 pub mod service;
+pub mod shutdown;
 // CONNECT-IP (tun/NAT) is Linux-only: it uses the Linux TUNSETIFF ioctl and
 // `libc::Ioctl` (defined only on linux_like targets). Windows/macOS builds
 // compile and serve the other protocols; see `masque::handle_connection`.
@@ -17,6 +18,13 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     // Validate before spawning or binding anything: a config that leaves the
     // process serving nothing must fail immediately, not start and exit.
     config.validate()?;
+
+    // Graceful-shutdown wiring: catch SIGTERM/SIGINT (and Ctrl-C) so the
+    // process unwinds and per-session `Drop` cleanup (notably CONNECT-IP's
+    // tun/iptables teardown) actually runs, then stop accepting and drain the
+    // live CONNECT-IP sessions (bounded) before returning.
+    let shutdown = shutdown::Shutdown::new();
+    shutdown::spawn_signal_handlers(shutdown.clone())?;
 
     if let Some(ref interval_str) = config.auto_upgrade {
         let interval = match upgrade::parse_interval(interval_str) {
@@ -43,18 +51,41 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
                 );
             }
             let masque = masque::MasqueServer::new(config.clone())?;
-            if config.run_tcp_proxy() {
+            // On shutdown the select arms drop the server future(s), which
+            // stops accepting (QUIC endpoint / TCP listener); the spawned
+            // CONNECT-IP session tasks observe the same trigger, tear their
+            // tunnels down, and are waited for by the drain below.
+            let result = if config.run_tcp_proxy() {
                 let tcp = server::ProxyServer::new(config)?;
-                // Run both concurrently; if either stops with an error, surface it.
-                tokio::try_join!(tcp.run(), masque.run())?;
+                tokio::select! {
+                    res = async {
+                        tokio::try_join!(tcp.run(), masque.run(shutdown.clone()))
+                    } => res.map(|_| ()),
+                    _ = shutdown.wait() => Ok(()),
+                }
             } else {
                 // --disable http: the TCP --listen port is never bound; MASQUE
                 // is the only listener.
-                masque.run().await?;
-            }
-            Ok(())
+                tokio::select! {
+                    res = masque.run(shutdown.clone()) => res,
+                    _ = shutdown.wait() => Ok(()),
+                }
+            };
+            // Bounded wait for live CONNECT-IP sessions to run their `TunDevice`
+            // teardown (interface delete, iptables rule removal, ip_forward
+            // restore) before the process exits.
+            shutdown.drain(shutdown::SESSION_DRAIN_TIMEOUT).await;
+            result
         }
         // `--disable http` never reaches here: `validate()` rejected it.
-        None => server::ProxyServer::new(config)?.run().await,
+        None => {
+            let proxy = server::ProxyServer::new(config)?;
+            let result = tokio::select! {
+                res = proxy.run() => res,
+                _ = shutdown.wait() => Ok(()),
+            };
+            shutdown.drain(shutdown::SESSION_DRAIN_TIMEOUT).await;
+            result
+        }
     }
 }

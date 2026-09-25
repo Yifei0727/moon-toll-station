@@ -82,6 +82,7 @@ use tracing::{debug, info, warn};
 
 use crate::capsule;
 use crate::config::AppConfig;
+use crate::shutdown::Shutdown;
 // CONNECT-IP (tun/NAT) is Linux-only; see `lib.rs`.
 #[cfg(target_os = "linux")]
 use crate::tun::{IpPool, TunDevice};
@@ -151,7 +152,10 @@ impl MasqueServer {
         Ok(Self { config })
     }
 
-    pub async fn run(self) -> anyhow::Result<()> {
+    /// Run the QUIC listener until the endpoint fails or a shutdown is
+    /// triggered (`shutdown`); every connection task gets a clone so CONNECT-IP
+    /// sessions observe the shutdown and tear their tun/NAT state down.
+    pub async fn run(self, shutdown: Shutdown) -> anyhow::Result<()> {
         let certs = load_certs(self.config.cert_chain.as_deref().unwrap()).await?;
         let key = load_key(self.config.key.as_deref().unwrap()).await?;
 
@@ -227,8 +231,12 @@ impl MasqueServer {
             let resolver = resolver.clone();
             let config = self.config.clone();
             let ip_pool = ip_pool.clone();
+            let shutdown = shutdown.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(h3_conn, peer, quinn_conn, resolver, config, ip_pool).await {
+                if let Err(e) =
+                    handle_connection(h3_conn, peer, quinn_conn, resolver, config, ip_pool, shutdown)
+                        .await
+                {
                     debug!(peer = %peer, error = %e, "masque connection ended");
                 }
             });
@@ -249,6 +257,10 @@ async fn handle_connection(
     // CONNECT-IP address pool; unused off-Linux (connect-ip is answered 501).
     #[cfg(target_os = "linux")] pool: Arc<StdMutex<IpPool>>,
     #[cfg(not(target_os = "linux"))] _pool: (),
+    // Shutdown trigger; only the Linux CONNECT-IP data plane consumes it
+    // (its tun/NAT teardown must run before process exit).
+    #[cfg(target_os = "linux")] shutdown: Shutdown,
+    #[cfg(not(target_os = "linux"))] _shutdown: Shutdown,
 ) -> anyhow::Result<()> {
     let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
 
@@ -367,6 +379,7 @@ async fn handle_connection(
                 let quinn_conn = quinn_conn.clone();
                 let routes = routes.clone();
                 let pool = pool.clone();
+                let shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_ip_stream(
                         req,
@@ -378,6 +391,7 @@ async fn handle_connection(
                         stream_id,
                         quinn_conn,
                         pool,
+                        shutdown,
                     )
                     .await
                     {
@@ -624,6 +638,7 @@ async fn handle_ip_stream<S>(
     stream_id: StreamId,
     quinn_conn: QuinnConnection,
     pool: Arc<StdMutex<IpPool>>,
+    shutdown: Shutdown,
 ) -> anyhow::Result<()>
 where
     S: quic::SendStream<Bytes> + quic::RecvStream + quic::BidiStream<Bytes>,
@@ -632,6 +647,13 @@ where
     <S as quic::BidiStream<Bytes>>::SendStream: Send + 'static,
     <S as quic::BidiStream<Bytes>>::RecvStream: Send + 'static,
 {
+    // Register this session as live for the shutdown drain. Declared FIRST so
+    // it drops LAST (locals drop in reverse order): the `TunDevice`'s `Drop`
+    // (the real host cleanup) runs before the session is counted as finished.
+    // (`_`-prefixed name: exempt from the unused warning but still owned —
+    // a bare `let _ =` would drop the guard immediately.)
+    let _session_guard = shutdown.register_session();
+
     let token = config.auth_token.as_deref();
 
     if let Err(status) = validate_connect_ip(&req, token) {
@@ -864,6 +886,13 @@ where
                 // Control stream ended (client closed it, or the capsule
                 // reader aborted): the tunnel is over.
                 debug!(peer = %peer, stream = %stream_id, "CONNECT-IP control stream ended; tearing down");
+                break;
+            }
+            _ = shutdown.wait() => {
+                // Process shutdown (SIGTERM/SIGINT): stop relaying; the `tun`
+                // is dropped when this task returns, running the host-side
+                // cleanup before the process exits.
+                info!(peer = %peer, stream = %stream_id, "shutting down; tearing down CONNECT-IP session");
                 break;
             }
         }
@@ -2075,7 +2104,7 @@ mod e2e {
 
         let server = MasqueServer::new(cli.config)?;
         let server_handle = tokio::spawn(async move {
-            let _ = server.run().await;
+            let _ = server.run(crate::shutdown::Shutdown::new()).await;
         });
 
         // --- Build a quinn + h3 client that trusts our self-signed cert. ---
@@ -2431,7 +2460,7 @@ mod e2e {
 
         let server = MasqueServer::new(cli.config)?;
         let server_handle = tokio::spawn(async move {
-            let _ = server.run().await;
+            let _ = server.run(crate::shutdown::Shutdown::new()).await;
         });
 
         // Local UDP echo socket — the single target for the tunnel.
@@ -2672,7 +2701,7 @@ mod e2e {
 
         let server = MasqueServer::new(cli.config)?;
         let server_handle = tokio::spawn(async move {
-            let _ = server.run().await;
+            let _ = server.run(crate::shutdown::Shutdown::new()).await;
         });
 
         // Local TCP echo server — the single target for the tunnel.
@@ -2911,7 +2940,7 @@ mod e2e {
 
         let server = MasqueServer::new(cli.config)?;
         let server_handle = tokio::spawn(async move {
-            let _ = server.run().await;
+            let _ = server.run(crate::shutdown::Shutdown::new()).await;
         });
 
         // Local TCP echo server — the origin the WebSocket-over-H3 tunnel pipes to.

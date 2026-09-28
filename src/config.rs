@@ -1,8 +1,14 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    time::Duration,
+};
 
-use anyhow::bail;
+use anyhow::{Context, bail};
+use bytes::Bytes;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::Level;
+
+use crate::capsule;
 
 /// Top-level CLI: optional server configuration flags plus an optional subcommand.
 #[derive(Debug, Parser)]
@@ -134,6 +140,34 @@ pub struct AppConfig {
 
     #[arg(
         long,
+        value_name = "IP[,IP...]",
+        help = "DNS resolvers to advertise to CONNECT-IP clients in a DNS_ASSIGN capsule (draft-ietf-masque-connect-ip-dns-06 §3.4, an unapproved draft — see docs/QUIC.md). IPv4 and IPv6 accepted; repeatable and/or comma-separated. Each address becomes its own nameserver with increasing SVCB service priority, so the order given IS the preference order. Unset (the default) means no DNS capsule is sent at all, preserving today's behaviour. Requires --enable h3."
+    )]
+    pub ip_dns: Vec<String>,
+
+    #[arg(
+        long,
+        value_name = "DOMAIN[,DOMAIN...]",
+        help = "DNS search domains (suffix list) advertised alongside --ip-dns (§3.3). Written with or without the root dot; sent as a fully qualified name. Repeatable and/or comma-separated. Ignored, and rejected as pointless, unless --ip-dns is set. Requires --enable h3."
+    )]
+    pub ip_dns_search: Vec<String>,
+
+    #[arg(
+        long,
+        value_name = "DOMAIN[,DOMAIN...]",
+        help = "Internal domains that the --ip-dns resolvers answer for; each covers its subdomains too (§3.5). Repeatable and/or comma-separated. When --ip-dns is set but this is omitted, the DNS root is advertised, meaning the resolvers answer every name; pass a bare \"\" to say so explicitly. Ignored unless --ip-dns is set. Requires --enable h3."
+    )]
+    pub ip_dns_internal: Vec<String>,
+
+    #[arg(
+        long,
+        value_name = "PREFIX/LEN",
+        help = "IPv6 NAT64 prefix(es) to advertise in a PREF64 capsule, for IPv6/IPv4 address synthesis (draft-ietf-masque-connect-ip-dns-06 §4.1). Prefix length must be 32, 40, 48, 56, 64 or 96 (RFC 6052 §2.2), e.g. 64:ff9b::/96. Repeatable; order is preserved. Unset means no PREF64 capsule is sent. Requires --enable h3."
+    )]
+    pub ip_nat64_prefix: Vec<String>,
+
+    #[arg(
+        long,
         value_name = "BYTES",
         help = "Cap QUIC datagram size when the path has a smaller MTU (avoids blackholed/fragmented handshakes). Applies to the HTTP/3 (QUIC) listener's transport config: the advertised max UDP payload size, the initial MTU and MTU discovery's upper bound are all clamped to this. Must be >= 1200 (the QUIC minimum)."
     )]
@@ -209,6 +243,180 @@ impl AppConfig {
         }
         Ok(())
     }
+
+    /// True when any CONNECT-IP DNS or NAT64 option was configured, i.e. the
+    /// request stream will carry something beyond RFC 9484's own capsules.
+    pub fn has_connect_ip_dns(&self) -> bool {
+        !self.ip_dns.is_empty() || !self.ip_nat64_prefix.is_empty()
+    }
+
+    /// Encode the CONNECT-IP `DNS_ASSIGN` / `PREF64` signalling capsules from
+    /// the `--ip-dns*` and `--ip-nat64-prefix` flags
+    /// (`draft-ietf-masque-connect-ip-dns-06`).
+    ///
+    /// Called once at `--enable h3` startup, so a bad combination fails there
+    /// rather than per-session — the same contract `--ip-pool` has. Everything
+    /// is validated *here* rather than in `capsule.rs`, because this is where an
+    /// actionable operator-facing message can be produced.
+    pub fn connect_ip_capsules(&self) -> anyhow::Result<capsule::ConnectIpCapsules> {
+        Ok(capsule::ConnectIpCapsules {
+            dns_assign: self.build_dns_assign()?,
+            pref64: self.build_pref64()?,
+        })
+    }
+
+    fn build_dns_assign(&self) -> anyhow::Result<Option<Bytes>> {
+        // One nameserver per address, priorities ascending in the order given:
+        // §3.2 requires ServiceMode (RFC 9460 §2.4.3), where alternatives are
+        // separate records ranked by priority and 0 is forbidden.
+        let mut nameservers = Vec::new();
+        for raw in split_flag_values(&self.ip_dns) {
+            let addr: IpAddr = raw
+                .parse()
+                .with_context(|| format!("--ip-dns: {raw:?} is not an IPv4 or IPv6 address"))?;
+            if nameservers.len() >= u16::MAX as usize {
+                bail!("--ip-dns: too many resolvers; SVCB service priority is a 16-bit field");
+            }
+            let (mut ipv4, mut ipv6) = (Vec::new(), Vec::new());
+            match addr {
+                IpAddr::V4(a) => ipv4.push(a),
+                IpAddr::V6(a) => ipv6.push(a),
+            }
+            nameservers.push(capsule::DnsNameserver {
+                service_priority: nameservers.len() as u16 + 1,
+                ipv4,
+                ipv6,
+                // No encrypted transport: unencrypted DNS over port 53 only, so
+                // §3.2 forbids an authentication domain and any alpn parameters.
+                auth_domain: String::new(),
+                service_parameters: Bytes::new(),
+            });
+        }
+
+        if nameservers.is_empty() {
+            if !self.ip_dns_search.is_empty() || !self.ip_dns_internal.is_empty() {
+                bail!(
+                    "--ip-dns-search/--ip-dns-internal are meaningless without at least one \
+                     --ip-dns resolver"
+                );
+            }
+            return Ok(None);
+        }
+
+        // §3.5: no qualification means the resolvers answer every name, which is
+        // expressed by advertising the DNS root.
+        let mut internal_domains = split_flag_values(&self.ip_dns_internal)
+            .map(|d| normalize_domain(d, true))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if internal_domains.is_empty() {
+            internal_domains.push(String::new());
+        }
+        let search_domains = split_flag_values(&self.ip_dns_search)
+            .map(|d| normalize_domain(d, false))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        Ok(Some(capsule::encode_dns_assign(&[
+            capsule::DnsConfiguration {
+                nameservers,
+                internal_domains,
+                search_domains,
+            },
+        ])))
+    }
+
+    fn build_pref64(&self) -> anyhow::Result<Option<Bytes>> {
+        let prefixes = split_flag_values(&self.ip_nat64_prefix)
+            .map(parse_nat64_prefix)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if prefixes.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(capsule::encode_pref64(&prefixes)))
+    }
+}
+
+/// Expand a repeatable flag that additionally accepts comma-separated values:
+/// `--ip-dns 8.8.8.8 --ip-dns 1.1.1.1` and `--ip-dns 8.8.8.8,1.1.1.1` are equal.
+fn split_flag_values(values: &[String]) -> impl Iterator<Item = &str> {
+    values
+        .iter()
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Canonicalise operator input into a DNS presentation-format name. §3.1 asks
+/// for a Fully Qualified Domain Name in IDNA A-label form, so we always emit the
+/// terminating root dot (which is also what `connect-ip-go` demands of its own
+/// inputs) whether or not the operator wrote it.
+///
+/// `allow_root` distinguishes the two places a name may legitimately be empty:
+/// an empty internal domain is the DNS root and means "resolves everything"
+/// (§3.5), whereas an empty search domain has no meaning.
+fn normalize_domain(raw: &str, allow_root: bool) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return if allow_root {
+            Ok(String::new())
+        } else {
+            bail!("{raw:?} is not a usable search domain; give a domain name");
+        };
+    }
+    let body = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    for label in body.split('.') {
+        if label.is_empty() {
+            bail!("{raw:?} has an empty label (leading, trailing or doubled dot)");
+        }
+        if label.len() > 63 {
+            bail!("{raw:?} has a label longer than the 63-octet DNS limit");
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            bail!("{raw:?} must be an IDNA A-label: lower-case ASCII letters, digits and '-'");
+        }
+    }
+    let fqdn = format!("{body}.");
+    if fqdn.len() > 255 {
+        bail!("{raw:?} exceeds the 255-octet limit of RFC 1035 §2.3.4");
+    }
+    Ok(fqdn)
+}
+
+/// `<IPv6-prefix>/<length>` -> a PREF64 `NAT64 Prefix`.
+fn parse_nat64_prefix(raw: &str) -> anyhow::Result<capsule::Nat64Prefix> {
+    let (addr, len) = raw.split_once('/').with_context(|| {
+        format!("--ip-nat64-prefix: {raw:?} must be <IPv6-prefix>/<length>, e.g. 64:ff9b::/96")
+    })?;
+    let addr: Ipv6Addr = addr
+        .trim()
+        .parse()
+        .with_context(|| format!("--ip-nat64-prefix: {addr:?} is not an IPv6 address"))?;
+    let len: u8 = len
+        .trim()
+        .parse()
+        .with_context(|| format!("--ip-nat64-prefix: {len:?} is not a prefix length"))?;
+    if !capsule::NAT64_PREFIX_LENGTHS.contains(&len) {
+        bail!(
+            "--ip-nat64-prefix: /{len} is not a permitted NAT64 prefix length; \
+             must be one of {:?} (RFC 6052 §2.2)",
+            capsule::NAT64_PREFIX_LENGTHS
+        );
+    }
+    // Reject non-canonical input ("64:ff9b::1/96"): the synthetic IPv4 space is
+    // determined by the prefix alone, so stray bits would silently mislead.
+    let mask = u128::MAX << (128 - len);
+    if u128::from(addr) & !mask != 0 {
+        bail!(
+            "--ip-nat64-prefix: {addr}/{len} has bits set below the prefix length; \
+             give the network address (e.g. {}/{len})",
+            Ipv6Addr::from(u128::from(addr) & mask)
+        );
+    }
+    let mut prefix = [0u8; 12];
+    prefix.copy_from_slice(&addr.octets()[..12]);
+    Ok(capsule::Nat64Prefix { prefix_len: len, prefix })
 }
 
 #[derive(Debug, Clone, Args)]
@@ -247,7 +455,9 @@ pub enum ServiceAction {
 #[cfg(test)]
 mod tests {
     use super::{AppConfig, Cli, DisableProtocol};
+    use crate::capsule;
     use clap::Parser;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn config_from(args: &[&str]) -> AppConfig {
         let mut argv = vec!["auto-server"];
@@ -333,5 +543,172 @@ mod tests {
         config_from(&args)
             .validate()
             .expect("1200 is the QUIC minimum and must be accepted");
+    }
+
+    // -- CONNECT-IP DNS / PREF64 (draft-ietf-masque-connect-ip-dns-06) ----
+
+    fn dns_capsule(args: &[&str]) -> Vec<capsule::DnsConfiguration> {
+        let bytes = config_from(args)
+            .connect_ip_capsules()
+            .expect("dns flags must be valid")
+            .dns_assign
+            .expect("expected a DNS_ASSIGN capsule");
+        capsule::decode_dns_assign(&bytes).expect("must decode what we encode")
+    }
+
+    #[test]
+    fn no_dns_flags_sends_no_dns_capsule() {
+        for args in [&[][..], H3_ARGS] {
+            let built = config_from(args)
+                .connect_ip_capsules()
+                .expect("default config is valid");
+            assert!(built.dns_assign.is_none(), "no DNS_ASSIGN by default");
+            assert!(built.pref64.is_none(), "no PREF64 by default");
+            assert!(built.is_empty());
+            assert!(!config_from(args).has_connect_ip_dns());
+        }
+    }
+
+    #[test]
+    fn ip_dns_accepts_repeatable_and_comma_separated_lists() {
+        // Both spellings must produce the same nameservers, ranked in the order
+        // the operator gave them (§3.2 ServiceMode forbids priority 0).
+        let repeated = dns_capsule(&["--ip-dns", "8.8.8.8", "--ip-dns", "2001:db8::1"]);
+        let comma = dns_capsule(&["--ip-dns", "8.8.8.8,2001:db8::1"]);
+        assert_eq!(repeated, comma);
+
+        let ns = &repeated[0].nameservers;
+        assert_eq!(ns.len(), 2);
+        assert_eq!(ns[0].service_priority, 1);
+        assert_eq!(ns[0].ipv4, vec![Ipv4Addr::new(8, 8, 8, 8)]);
+        assert!(ns[0].ipv6.is_empty());
+        assert_eq!(ns[1].service_priority, 2);
+        assert_eq!(ns[1].ipv6, vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)]);
+
+        // Unencrypted DNS only -> no authentication domain, no SvcParams (§3.2).
+        assert!(ns[0].auth_domain.is_empty());
+        assert!(ns[0].service_parameters.is_empty());
+    }
+
+    #[test]
+    fn ip_dns_defaults_internal_domains_to_the_dns_root() {
+        // §3.5: an empty internal domain is the DNS root, i.e. these resolvers
+        // answer every name — the only sensible reading of an unqualified
+        // `--ip-dns`.
+        assert_eq!(dns_capsule(&["--ip-dns", "8.8.8.8"])[0].internal_domains, vec![""]);
+
+        // Explicit root and a real split-horizon domain both survive round-trip.
+        assert_eq!(
+            dns_capsule(&["--ip-dns", "8.8.8.8", "--ip-dns-internal", "."])[0].internal_domains,
+            vec![""]
+        );
+        assert_eq!(
+            dns_capsule(&[
+                "--ip-dns",
+                "8.8.8.8",
+                "--ip-dns-internal",
+                "internal.corp.example"
+            ])[0]
+                .internal_domains,
+            vec!["internal.corp.example."]
+        );
+    }
+
+    #[test]
+    fn domains_are_sent_as_dot_terminated_fqdns() {
+        let cfg = dns_capsule(&[
+            "--ip-dns",
+            "8.8.8.8",
+            "--ip-dns-search",
+            "corp.example,example.net.",
+        ]);
+        assert_eq!(cfg[0].search_domains, vec!["corp.example.", "example.net."]);
+    }
+
+    #[test]
+    fn malformed_dns_flags_are_rejected_at_build_time() {
+        for (args, needle) in [
+            (vec!["--ip-dns", "not-an-ip"], "--ip-dns"),
+            (
+                vec!["--ip-dns", "8.8.8.8", "--ip-dns-search", "corp..example"],
+                "empty label",
+            ),
+            (
+                vec!["--ip-dns", "8.8.8.8", "--ip-dns-search", "Corp.Example"],
+                "A-label",
+            ),
+        ] {
+            let mut full = H3_ARGS.to_vec();
+            full.extend_from_slice(&args);
+            let err = config_from(&full)
+                .connect_ip_capsules()
+                .expect_err("invalid dns flags must be rejected");
+            assert!(
+                err.to_string().contains(needle),
+                "expected {needle:?} in: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn domain_flags_without_a_resolver_are_rejected() {
+        let err = config_from(&["--ip-dns-search", "corp.example"])
+            .connect_ip_capsules()
+            .expect_err("search domains without a resolver are pointless");
+        assert!(err.to_string().contains("--ip-dns"), "got: {err}");
+    }
+
+    #[test]
+    fn nat64_prefix_flags_round_trip() {
+        let built = config_from(&[
+            "--ip-nat64-prefix",
+            "64:ff9b::/96",
+            "--ip-nat64-prefix",
+            "2001:db8:64::/48",
+        ])
+        .connect_ip_capsules()
+        .expect("valid NAT64 prefixes");
+        let bytes = built.pref64.expect("expected a PREF64 capsule");
+        let prefixes = capsule::decode_pref64(&bytes).expect("must decode what we encode");
+
+        assert_eq!(prefixes.len(), 2);
+        let mut well_known = [0u8; 12];
+        well_known[..4].copy_from_slice(&[0x00, 0x64, 0xff, 0x9b]);
+        assert_eq!(prefixes[0].prefix_len, 96);
+        assert_eq!(prefixes[0].prefix, well_known);
+        let mut local = [0u8; 12];
+        local[..6].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0x00, 0x64]);
+        assert_eq!(prefixes[1].prefix_len, 48);
+        assert_eq!(prefixes[1].prefix, local);
+    }
+
+    #[test]
+    fn malformed_nat64_prefixes_are_rejected() {
+        for (arg, needle) in [
+            ("64:ff9b::", "must be"),
+            ("64:ff9b::/95", "prefix length"),
+            ("64:ff9b::/97", "prefix length"),
+            ("64:ff9b::/128", "prefix length"),
+            ("64:ff9b::1/96", "below the prefix length"),
+            ("8.8.8.8/32", "IPv6 address"),
+        ] {
+            let mut full = H3_ARGS.to_vec();
+            full.extend_from_slice(&["--ip-nat64-prefix", arg]);
+            let err = config_from(&full)
+                .connect_ip_capsules()
+                .expect_err("{arg} must be rejected");
+            assert!(err.to_string().contains(needle), "{arg} -> {err}");
+        }
+    }
+
+    #[test]
+    fn too_long_domain_is_rejected() {
+        let long = format!("{}.example", "a".repeat(64));
+        let mut full = H3_ARGS.to_vec();
+        full.extend_from_slice(&["--ip-dns", "8.8.8.8", "--ip-dns-search", &long]);
+        let err = config_from(&full)
+            .connect_ip_capsules()
+            .expect_err("over-long label must be rejected");
+        assert!(err.to_string().contains("63-octet"), "got: {err}");
     }
 }

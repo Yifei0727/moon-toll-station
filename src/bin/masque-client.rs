@@ -10,6 +10,10 @@
 //! | `ws`       | WebSocket over HTTP/3 (RFC 9220) | `:protocol=websocket`, target in `:authority`, byte pipe |
 //! | `ip`       | CONNECT-IP (RFC 9484) | `:protocol=connect-ip`, signalling capsules on the stream, packets = `Context ID 0` + raw IP |
 //!
+//! In `ip` mode it also prints any `DNS_ASSIGN` / `PREF64` capsules the proxy
+//! pushes (`draft-ietf-masque-connect-ip-dns-06`), reporting `none` when the
+//! proxy sends neither.
+//!
 //! Every mode reports `PASS`/`FAIL` per step (handshake, response status, data
 //! round-trip) and exits non-zero if anything fails, so it can be dropped into
 //! a shell loop or CI step:
@@ -99,6 +103,12 @@ const ROUNDTRIP_WAIT: Duration = Duration::from_secs(10);
 /// capsules (the control stream stays open for the tunnel's lifetime, so this
 /// must not wait for EOF).
 const CAPSULE_WAIT: Duration = Duration::from_secs(5);
+
+/// How long to keep reading past the mandatory RFC 9484 capsules for the
+/// optional draft-ietf-masque-connect-ip-dns-06 pair. They arrive immediately
+/// after ROUTE_ADVERTISEMENT on the same stream, so this only needs to cover
+/// scheduling jitter, not a round trip.
+const DNS_CAPSULE_GRACE: Duration = Duration::from_millis(750);
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -800,6 +810,162 @@ async fn run_ip(common: &Common, args: IpArgs) -> anyhow::Result<()> {
     result
 }
 
+/// The signalling capsules a CONNECT-IP proxy pushes during setup. The RFC 9484
+/// pair is mandatory; the draft-ietf-masque-connect-ip-dns-06 pair is optional.
+#[derive(Default)]
+struct IpSignalling {
+    assign: Option<Vec<capsule::AssignedAddress>>,
+    routes: Option<Vec<capsule::IpRange>>,
+    dns: Option<Vec<capsule::DnsConfiguration>>,
+    pref64: Option<Vec<capsule::Nat64Prefix>>,
+}
+
+impl IpSignalling {
+    fn has_rfc9484(&self) -> bool {
+        self.assign.is_some() && self.routes.is_some()
+    }
+
+    fn has_all_optional(&self) -> bool {
+        self.dns.is_some() && self.pref64.is_some()
+    }
+
+    /// Drain every complete capsule out of `pending`, keeping any partial tail
+    /// so a capsule split across `recv_data` chunks still decodes.
+    fn absorb(&mut self, pending: &mut BytesMut) -> anyhow::Result<()> {
+        let mut scanned = 0usize;
+        while let Some((typ, value, used)) = capsule::split_capsule(&pending[scanned..]) {
+            let value = value.to_vec();
+            scanned += used;
+            match typ {
+                capsule::CAPSULE_ADDRESS_ASSIGN => {
+                    self.assign = Some(
+                        capsule::decode_address_value(&value)
+                            .ok_or_else(|| anyhow!("malformed ADDRESS_ASSIGN payload"))?,
+                    );
+                }
+                capsule::CAPSULE_ROUTE_ADVERTISEMENT => {
+                    self.routes = Some(
+                        capsule::decode_route_value(&value)
+                            .ok_or_else(|| anyhow!("malformed ROUTE_ADVERTISEMENT payload"))?,
+                    );
+                }
+                // draft-ietf-masque-connect-ip-dns-06. A server with no DNS or
+                // NAT64 configured sends neither, hence both stay `None`.
+                capsule::CAPSULE_DNS_ASSIGN => {
+                    self.dns = Some(
+                        capsule::decode_dns_value(&value)
+                            .ok_or_else(|| anyhow!("malformed DNS_ASSIGN payload"))?,
+                    );
+                }
+                capsule::CAPSULE_PREF64 => {
+                    self.pref64 = Some(
+                        capsule::decode_pref64_value(&value)
+                            .ok_or_else(|| anyhow!("malformed PREF64 payload"))?,
+                    );
+                }
+                // RFC 9297 §3.2: unknown capsule types are silently skipped.
+                _ => {}
+            }
+        }
+        let _ = pending.split_to(scanned);
+        Ok(())
+    }
+}
+
+/// Print the DNS configuration advertised via `DNS_ASSIGN`
+/// (draft-ietf-masque-connect-ip-dns-06 §3.4).
+fn print_dns_assign(configs: &Option<Vec<capsule::DnsConfiguration>>) {
+    let Some(configs) = configs else {
+        info("DNS_ASSIGN          none (server sent no DNS configuration)");
+        return;
+    };
+    if configs.is_empty() {
+        info("DNS_ASSIGN          empty (server advertises no DNS configuration)");
+        return;
+    }
+    info(&format!(
+        "DNS_ASSIGN          {} configuration(s)",
+        configs.len()
+    ));
+    for cfg in configs {
+        for ns in &cfg.nameservers {
+            let addrs: Vec<String> = ns
+                .ipv4
+                .iter()
+                .map(|a| a.to_string())
+                .chain(ns.ipv6.iter().map(|a| a.to_string()))
+                .collect();
+            detail(&format!(
+                "nameserver prio {:<3} {}",
+                ns.service_priority,
+                addrs.join(", ")
+            ));
+            if !ns.auth_domain.is_empty() {
+                detail(&format!("  auth domain      {}", ns.auth_domain));
+            }
+            if !ns.service_parameters.is_empty() {
+                detail(&format!(
+                    "  svc params       {} byte(s) opaque SVCB",
+                    ns.service_parameters.len()
+                ));
+            }
+        }
+        if !cfg.internal_domains.is_empty() {
+            detail(&format!(
+                "  internal domains {}",
+                display_domains(&cfg.internal_domains)
+            ));
+        }
+        if !cfg.search_domains.is_empty() {
+            detail(&format!(
+                "  search domains   {}",
+                display_domains(&cfg.search_domains)
+            ));
+        }
+    }
+}
+
+/// Print the NAT64 prefixes advertised via `PREF64`
+/// (draft-ietf-masque-connect-ip-dns-06 §4.1).
+fn print_pref64(prefixes: &Option<Vec<capsule::Nat64Prefix>>) {
+    let Some(prefixes) = prefixes else {
+        info("PREF64              none (server sent no NAT64 prefixes)");
+        return;
+    };
+    if prefixes.is_empty() {
+        info("PREF64              empty (NAT64 unavailable)");
+        return;
+    }
+    info(&format!("PREF64              {} prefix(es)", prefixes.len()));
+    for p in prefixes {
+        // The 96-bit field is the top of an IPv6 address; widen it to print it.
+        let mut octets = [0u8; 16];
+        octets[..12].copy_from_slice(&p.prefix);
+        detail(&format!(
+            "nat64 prefix        {}/{}",
+            Ipv6Addr::from(octets),
+            p.prefix_len
+        ));
+    }
+}
+
+/// Join domain names for display, spelling out the DNS root explicitly: an empty
+/// internal domain means "resolves everything" (§3.5), which would otherwise
+/// print as a blank entry.
+fn display_domains(domains: &[String]) -> String {
+    domains
+        .iter()
+        .map(|d| {
+            if d.is_empty() {
+                "\"\" (DNS root)".to_string()
+            } else {
+                d.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 async fn ip_session(
     proxy: &mut Proxy,
     common: &Common,
@@ -843,64 +1009,73 @@ async fn ip_session(
 
     // RFC 9484 §4.7: ADDRESS_ASSIGN / ROUTE_ADVERTISEMENT arrive on the request
     // stream as RFC 9297 capsules (Type + Length + Value), never as datagrams.
+    // draft-ietf-masque-connect-ip-dns-06 adds DNS_ASSIGN / PREF64 to the same
+    // stream; both are optional, so we wait only briefly for them.
     let signalling = check("signalling capsules", async {
         let mut pending = BytesMut::new();
-        let mut assign: Option<Vec<capsule::AssignedAddress>> = None;
-        let mut routes: Option<Vec<capsule::IpRange>> = None;
+        let mut seen = IpSignalling::default();
 
-        while assign.is_none() || routes.is_none() {
+        while !seen.has_rfc9484() {
             let mut chunk = tokio::time::timeout(CAPSULE_WAIT, req_stream.recv_data())
                 .await
                 .map_err(|_| anyhow!("no capsule within {CAPSULE_WAIT:?}"))?
                 .context("recv_data failed")?
                 .ok_or_else(|| anyhow!("request stream ended before both capsules arrived"))?;
             pending.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
-
-            // Cooperative-compose: keep the buffered remainder between frame
-            // boundaries so a capsule split across chunks still decodes.
-            let mut scanned = 0usize;
-            while let Some((typ, value, used)) = capsule::split_capsule(&pending[scanned..]) {
-                let value = value.to_vec();
-                scanned += used;
-                match typ {
-                    capsule::CAPSULE_ADDRESS_ASSIGN => {
-                        assign = Some(
-                            capsule::decode_address_value(&value)
-                                .ok_or_else(|| anyhow!("malformed ADDRESS_ASSIGN payload"))?,
-                        );
-                    }
-                    capsule::CAPSULE_ROUTE_ADVERTISEMENT => {
-                        routes = Some(
-                            capsule::decode_route_value(&value)
-                                .ok_or_else(|| anyhow!("malformed ROUTE_ADVERTISEMENT payload"))?,
-                        );
-                    }
-                    _ => {}
-                }
-            }
-            let _ = pending.split_to(scanned);
+            seen.absorb(&mut pending)?;
         }
 
-        let assign = assign.ok_or_else(|| anyhow!("no ADDRESS_ASSIGN capsule"))?;
-        let routes = routes.ok_or_else(|| anyhow!("no ROUTE_ADVERTISEMENT capsule"))?;
-        Ok((assign, routes))
+        // Optional tail: §5 requires DNS_ASSIGN to follow the ROUTE_ADVERTISEMENT
+        // it belongs to, so whatever arrives now does so within one round trip.
+        // A timeout here is not a failure — it just means "nothing configured".
+        let deadline = tokio::time::Instant::now() + DNS_CAPSULE_GRACE;
+        while !seen.has_all_optional() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(Some(mut chunk))) =
+                tokio::time::timeout(remaining, req_stream.recv_data()).await
+            else {
+                break;
+            };
+            pending.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+            seen.absorb(&mut pending)?;
+        }
+
+        let assign = seen
+            .assign
+            .ok_or_else(|| anyhow!("no ADDRESS_ASSIGN capsule"))?;
+        let routes = seen
+            .routes
+            .ok_or_else(|| anyhow!("no ROUTE_ADVERTISEMENT capsule"))?;
+        Ok(IpSignalling {
+            assign: Some(assign),
+            routes: Some(routes),
+            ..seen
+        })
     })
     .await?;
 
-    let (assign, routes) = signalling;
-    let assigned = assign
-        .first()
+    let assigned = signalling
+        .assign
+        .as_ref()
+        .and_then(|a| a.first())
         .map(|a| (a.address, a.prefix_len))
         .ok_or_else(|| anyhow!("ADDRESS_ASSIGN carried no address"))?;
     info(&format!("ADDRESS_ASSIGN      {}/{}", assigned.0, assigned.1));
     info(&format!(
         "ROUTE_ADVERTISEMENT {} range(s){}",
-        routes.len(),
-        routes
-            .first()
+        signalling.routes.as_ref().map(|r| r.len()).unwrap_or(0),
+        signalling
+            .routes
+            .as_ref()
+            .and_then(|r| r.first())
             .map(|r| format!(": {}..={} proto {}", r.start, r.end, r.ip_protocol))
             .unwrap_or_default()
     ));
+    print_dns_assign(&signalling.dns);
+    print_pref64(&signalling.pref64);
 
     let client_v4 = match assigned.0 {
         IpAddr::V4(v4) => v4,

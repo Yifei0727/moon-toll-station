@@ -521,11 +521,49 @@ method, on a non-`/masque/ip` path, or if a `CONNECT-UDP` request lands on the I
 
 ```
 auto-server --enable h3 --key key.pem --cert-chain cert.pem --auth-token <TOKEN> \
-            --ip-pool 198.18.0.0/15 --h3-bind 0.0.0.0:8443
+            --ip-pool 198.18.0.0/15 --h3-bind 0.0.0.0:8443 \
+            --ip-dns 8.8.8.8,2001:db8::1 --ip-nat64-prefix 64:ff9b::/96
 ```
 
 `--enable h3`, `--key`, `--cert-chain`, `--auth-token` behave exactly as in §2. `--ip-pool` is the
-only new flag; it is optional and defaults to `198.18.0.0/15`.
+server-side address pool. The four DNS/NAT64 flags below are optional and **off by default** — unset,
+nothing beyond RFC 9484's own capsules is sent.
+
+### DNS and NAT64 configuration capsules (`draft-ietf-masque-connect-ip-dns-06`)
+
+> **This is an unapproved IETF draft, not an RFC.** The capsule type numbers are explicitly
+> *provisional*: §6 states they "will be replaced by a smaller one before publication", and the IANA
+> [HTTP Capsule Types](https://www.iana.org/assignments/masque) registry does not carry them yet. A
+> future revision may renumber them. Pin `--ip-dns`/`--ip-nat64-prefix` only against clients built
+> from the same revision (Chrome/WARP-style clients included).
+
+| flag | capsule sent | notes |
+|------|--------------|-------|
+| `--ip-dns <IP>[,<IP>...]` | `DNS_ASSIGN` (0x1ACE79EC) | IPv4 and IPv6; repeatable and/or comma-separated. **Each address becomes its own nameserver with increasing SVCB service priority, so the order given is the preference order.** |
+| `--ip-dns-search <DOMAIN>[,<DOMAIN>...]` | contributes to `DNS_ASSIGN` | Suffix list. Written with or without the root dot; sent as a fully-qualified (dot-terminated) name. Rejected unless `--ip-dns` is set. |
+| `--ip-dns-internal <DOMAIN>[,<DOMAIN>...]` | contributes to `DNS_ASSIGN` | Split-horizon domains; each covers its subdomains. **Defaults to the DNS root when `--ip-dns` is set but this is omitted**, i.e. the resolvers answer every name. |
+| `--ip-nat64-prefix <PREFIX/LEN>` | `PREF64` (0x274C0FBC) | Repeatable. Length must be 32, 40, 48, 56, 64 or 96 (RFC 6052 §2.2), e.g. `64:ff9b::/96`. Bits below the prefix length must be zero. |
+
+What the server sends, and when, per session:
+
+1. `ADDRESS_ASSIGN`, then `ROUTE_ADVERTISEMENT` (unchanged from before);
+2. `DNS_ASSIGN` **after** the `ROUTE_ADVERTISEMENT` — §5 requires this ordering, because acting on a
+   resolver that the advertised routes do not cover would leak queries outside the tunnel;
+3. `PREF64` last, if any NAT64 prefix is configured.
+
+Both are pushed **unsolicited**: the draft has no request/response pair. A request capsule
+(`DNS_REQUEST`) existed up to revision `-03` (0x818F79F, alongside `DNS_ASSIGN` = 0x818F79E) and was
+**removed in -04**, so there is nothing for a client to send to solicit DNS configuration here. A
+client that nevertheless sends one has it silently skipped as an unknown capsule type, per RFC 9297
+§3.2. Configuration going the other way (a client's own `DNS_ASSIGN`/`PREF64`) is parsed
+for logging and then ignored — §3.5 says IP proxies ignore DNS configuration sent by clients.
+
+Later capsules supersede earlier ones in the same direction, so the assignment may be re-sent and
+updated. Neither capsule carries a lifetime field.
+
+The `--ip-dns` nameservers advertise unencrypted DNS only: the Authentication Domain Name is empty
+and no SVCB Service Parameters are included, which is what §3.2 mandates for port-53 resolvers.
+Encrypted DNS transports (DoH/DoQ/DoT via `alpn`/`dohpath`) are deliberately not configurable today.
 
 ## Verification
 
@@ -535,7 +573,14 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 
 
 # 2. Start (must be root for tun/NAT; use a high UDP port to avoid needing root for 443):
 sudo auto-server --enable h3 --key key.pem --cert-chain cert.pem --auth-token s3cr3t \
-                 --ip-pool 198.18.0.0/15 --h3-bind 0.0.0.0:8443
+                 --ip-pool 198.18.0.0/15 --h3-bind 0.0.0.0:8443 \
+                 --ip-dns 8.8.8.8,2001:db8::1 --ip-nat64-prefix 64:ff9b::/96
+
+# 2b. Same, inside a throwaway network namespace (root inside the namespace only —
+#     reconfigures nothing on the host and needs no sudo):
+unshare -Urn -- sh -c 'ip link set lo up; exec auto-server --enable h3 --key key.pem \
+  --cert-chain cert.pem --auth-token s3cr3t --h3-bind 127.0.0.1:8443 \
+  --ip-dns 8.8.8.8,2001:db8::1 --ip-nat64-prefix 64:ff9b::/96'
 
 # 3. After a client connects you should see:
 #       CONNECT-IP tunnel established tun=tun0 proxy=198.18.0.0 client=198.18.0.2 prefix=30
@@ -557,6 +602,19 @@ sudo auto-server --enable h3 --key key.pem --cert-chain cert.pem --auth-token s3
   `ADDRESS_ASSIGN` for `198.18.0.2/32` = `01 07 00 04 c6 12 00 02 20`) plus rejection of
   malformed/truncated input (wrong IP version, truncated addresses, Start > End, out-of-range
   prefix lengths).
+  The same module covers `draft-ietf-masque-connect-ip-dns-06`: `DNS_ASSIGN` byte-exact encoding
+  (the split-tunnel example of §3.6.2, with Type `0x1ACE79EC` in 4-byte varint form
+  `9A CE 79 EC`), `PREF64` byte-exact encoding of `64:ff9b::/96` straight from §4.3
+  (`A7 4C 0F BC 0D 60 00 64 ff 9b ...`), multi-configuration and multi-prefix round-trips, and
+  rejection of the malformed cases the draft calls out — Service Priority 0, a value length that is
+  not a multiple of 13, out-of-set NAT64 prefix lengths (only 32/40/48/56/64/96 are legal),
+  over-long domains, non-UTF-8 names, truncation and trailing garbage. Note there is deliberately
+  **no** count prefixing the list of DNS Configurations; each is self-delimiting and the list runs
+  to the end of the value.
+- `config` module: `--ip-dns`/`--ip-dns-search`/`--ip-dns-internal`/`--ip-nat64-prefix` parsing —
+  repeatable vs comma-separated equivalence, root-defaulting internal domains, dot-terminated FQDN
+  normalisation, and rejection of bad addresses, non-A-labels, empty labels, domain flags without a
+  resolver, non-canonical prefixes and illegal prefix lengths.
 - `tun` module: pool allocation (distinct `/30` blocks), exhaustion, bad-CIDR rejection, and a
   `cstr`-to-`String` helper. The real device/routing/NAT test (`tun_integration`) is `#[ignore]`d
   and additionally skips unless `uid == 0` and `ip`/`iptables` exist.
@@ -577,6 +635,36 @@ run explicitly:
 cargo test -- --ignored tun_integration
 cargo test -- --ignored e2e_connect_ip_roundtrip
 ```
+
+### Hand-verifying the DNS / NAT64 capsules
+
+`masque-client ip` prints whatever `DNS_ASSIGN` / `PREF64` the proxy pushes, and reports `none`
+when the proxy sends neither — which is also how you confirm that an unconfigured server behaves
+exactly as it did before these flags existed:
+
+```
+# Server started with --ip-dns 8.8.8.8,2001:db8::1 --ip-dns-search corp.example \
+#                     --ip-nat64-prefix 64:ff9b::/96
+masque-client --proxy 127.0.0.1:8443 --ca cert.pem --token s3cr3t ip
+  signalling capsules                  ... PASS
+      ADDRESS_ASSIGN      198.18.0.2/30
+      ROUTE_ADVERTISEMENT 1 range(s): 0.0.0.0..=255.255.255.255 proto 0
+      DNS_ASSIGN          1 configuration(s)
+      nameserver prio 1   8.8.8.8
+      nameserver prio 2   2001:db8::1
+        internal domains "" (DNS root)
+        search domains   corp.example.
+      PREF64              1 prefix(es)
+      nat64 prefix        64:ff9b::/96
+
+# Same server WITHOUT the DNS flags:
+      DNS_ASSIGN          none (server sent no DNS configuration)
+      PREF64              none (server sent no NAT64 prefixes)
+```
+
+The client reuses the server's `capsule` codec, so — as with everything else this client does — a
+green run proves round-trip behaviour, not third-party conformance. Verifying interop against a
+`connect-ip-go` client or proxy still requires that external implementation.
 
 ## Known limitations
 
@@ -601,6 +689,18 @@ cargo test -- --ignored e2e_connect_ip_roundtrip
 - **IPv4-only egress NAT by default.** The MASQUERADE/forwarding rules are installed per allocated
   prefix; a dual-stack client is served on whichever family its assigned address is, but the
   default route advertisement is per-family based on the assigned address.
+- **DNS / NAT64 configuration rides on an unapproved draft.** `--ip-dns*` and `--ip-nat64-prefix`
+  implement `draft-ietf-masque-connect-ip-dns-06`. Both capsule type numbers (0x1ACE79EC,
+  0x274C0FBC) are *provisional* and absent from the IANA registry; expect them to change if the
+  document is published. Treat cross-version interop as unverified until third-party confirmation.
+- **No client-side solicitation.** Revision -06 dropped the `DNS_REQUEST` capsule that -00..-03
+  briefly defined, so the proxy pushes `DNS_ASSIGN` unsolicited and there is nothing a client can
+  send to ask for it. A stray `DNS_REQUEST` from an old client is skipped silently as an unknown
+  capsule type (RFC 9297 §3.2). Client-to-proxy `DNS_ASSIGN`/`PREF64` is parsed for logging and
+  then ignored, per §3.5.
+- **Unencrypted DNS only.** `--ip-dns` resolvers are advertised without an Authentication Domain
+  Name or SVCB Service Parameters, which is what §3.2 mandates for plain port-53 DNS. Encrypted
+  transports (DoH/DoQ/DoT) are expressible on the wire but not configurable today.
 - **Pre-release crates:** same `h3` 0.0.8 / `h3-quinn` 0.0.10 / `h3-datagram` 0.0.2 caveat as §2.
 - **musl cross-compile:** the tun device is created through **raw `libc` ioctls**
   (`TUNSETIFF`/`IFF_TUN`/`IFF_NO_PI`), which are architecture-independent and musl-safe. The

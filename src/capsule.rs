@@ -26,6 +26,9 @@
 //!     IP Address (32 or 128 bits), IP Prefix Length (8)`.
 //!   - IP Address Range: `IP Version (8), Start IP Address (32/128),
 //!     End IP Address (32/128), IP Protocol (8)`.
+//!   - DNS/NAT64 configuration (`draft-ietf-masque-connect-ip-dns-06`): unlike
+//!     the above these *are* nested and counted — see the `DNS_ASSIGN` and
+//!     `PREF64` sections below.
 //!
 //! All of this is pure, allocation-light, and fully unit-testable without root
 //! or a network device.
@@ -61,6 +64,28 @@ pub const CAPSULE_ADDRESS_REQUEST: u64 = 0x02;
 /// `ROUTE_ADVERTISEMENT` (0x03) — an endpoint advertises the IP address ranges
 /// it is willing to route for its peer (RFC 9484 §4.7.3).
 pub const CAPSULE_ROUTE_ADVERTISEMENT: u64 = 0x03;
+
+// Capsule type numbers below come from
+// `draft-ietf-masque-connect-ip-dns-06` §6, NOT from the IANA registry: the
+// draft is not approved, so the "HTTP Capsule Types" registry does not list
+// these yet. §6 explicitly marks both values **provisional** ("will be replaced
+// by a smaller one before publication"), so they are protocol-frozen only for
+// this draft revision — a future revision can renumber them. `connect-ip-go`'s
+// `capsule.go` (master) encodes exactly these values, which is our
+// interoperability cross-check.
+
+/// `DNS_ASSIGN` (0x1ACE79EC) — an endpoint sends DNS configuration to its peer
+/// (`draft-ietf-masque-connect-ip-dns-06` §3.4).
+///
+/// There is deliberately **no** `DNS_REQUEST` here: that capsule existed up to
+/// revision -03 (value 0x818F79F) and was removed in -04. See
+/// [`CAPSULE_ADDRESS_REQUEST`] for the capsule this extension does not define.
+pub const CAPSULE_DNS_ASSIGN: u64 = 0x1ACE_79EC;
+
+/// `PREF64` (0x274C0FBC) — an endpoint communicates the IPv6 NAT64 prefixes to
+/// use for IPv6/IPv4 address synthesis (`draft-ietf-masque-connect-ip-dns-06`
+/// §4.1). Same provisional caveat as [`CAPSULE_DNS_ASSIGN`].
+pub const CAPSULE_PREF64: u64 = 0x274C_0FBC;
 
 // ---------------------------------------------------------------------------
 // CONNECT-IP signalling structures (RFC 9484 §4.7)
@@ -330,6 +355,297 @@ pub fn decode_route_advertisement(capsule: &[u8]) -> Option<Vec<IpRange>> {
     match decode_capsule(capsule) {
         Some((CAPSULE_ROUTE_ADVERTISEMENT, v)) => decode_route_value(&v),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DNS_ASSIGN / PREF64 payloads (draft-ietf-masque-connect-ip-dns-06)
+// ---------------------------------------------------------------------------
+
+/// NAT64 prefix lengths permitted by §4.1 — the IPv6-to-IPv4 address synthesis
+/// sizes listed in RFC 6052 §2.2. This is a **closed** set: a peer sending any
+/// other length has sent a malformed capsule (§4.2).
+pub const NAT64_PREFIX_LENGTHS: [u8; 6] = [32, 40, 48, 56, 64, 96];
+
+/// RFC 1035 §2.3.4 caps a wire-format domain name at 255 octets.
+const MAX_DOMAIN_NAME_LEN: usize = 255;
+
+/// SvcParams use DNS RDATA encoding, whose RDLENGTH field is 16 bits
+/// (RFC 1035 §4.1.3, referenced by RFC 9460 §2.2).
+const MAX_SERVICE_PARAMETERS_LEN: usize = u16::MAX as usize;
+
+/// One `NAT64 Prefix` (§4.1 Figure 8). Exactly 13 bytes on the wire, always.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Nat64Prefix {
+    /// Length of [`Self::prefix`] used for synthesis. One of
+    /// [`NAT64_PREFIX_LENGTHS`].
+    pub prefix_len: u8,
+    /// The highest 96 bits of the IPv6 prefix, network byte order. This field
+    /// is always 12 bytes — it does **not** shrink with `prefix_len` (§4.1).
+    pub prefix: [u8; 12],
+}
+
+/// One `Nameserver` (§3.2 Figure 2): a SVCB ServiceMode record carrying the
+/// resolver's addresses, its optional authentication domain, and Service
+/// Parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsNameserver {
+    /// Priority relative to sibling nameservers (SVCB ServiceMode, RFC 9460
+    /// §2.4.1). §3.2 forbids 0.
+    pub service_priority: u16,
+    pub ipv4: Vec<Ipv4Addr>,
+    pub ipv6: Vec<Ipv6Addr>,
+    /// Domain name used to authenticate an encrypted transport; empty when the
+    /// nameserver only offers unencrypted DNS (§3.2).
+    pub auth_domain: String,
+    /// SVCB Service Parameters (RFC 9460 §2.2) kept **opaque**: this layer never
+    /// generates them, and interpreting the individual keys (alpn, port,
+    /// dohpath, ...) is a job for whoever configures or consumes DNS.
+    pub service_parameters: Bytes,
+}
+
+/// One `DNS Configuration` (§3.3 Figure 3). A single capsule may carry several,
+/// when different resolvers serve different internal domains (§3.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsConfiguration {
+    pub nameservers: Vec<DnsNameserver>,
+    /// Domains (and their subdomains, §3.5) the nameservers here can resolve.
+    /// An empty string is the DNS root, i.e. "resolves everything".
+    pub internal_domains: Vec<String>,
+    /// Search-path suffixes appended during name resolution.
+    pub search_domains: Vec<String>,
+}
+
+/// Write one `Domain` (§3.1 Figure 1): `Domain Length (i) + Domain Name`.
+fn put_domain(v: &mut BytesMut, name: &str) {
+    put_varint(v, name.len() as u64);
+    v.extend_from_slice(name.as_bytes());
+}
+
+/// Read one `Domain`, rejecting trailing junk and non-UTF-8 (an IDNA A-label is
+/// ASCII by definition, §3.1).
+fn get_domain(buf: &mut &[u8]) -> Option<String> {
+    let len = get_varint(buf)? as usize;
+    if len > MAX_DOMAIN_NAME_LEN || buf.len() < len {
+        return None;
+    }
+    let name = std::str::from_utf8(&buf[..len]).ok()?.to_owned();
+    *buf = &buf[len..];
+    Some(name)
+}
+
+/// Read a counted run of `Domain` structures (used verbatim for both Internal
+/// and Search Domains, §3.3).
+fn get_domain_list(buf: &mut &[u8]) -> Option<Vec<String>> {
+    let count = get_varint(buf)?;
+    let mut domains = Vec::new();
+    for _ in 0..count {
+        domains.push(get_domain(buf)?);
+    }
+    Some(domains)
+}
+
+/// Encode the payload of a `DNS_ASSIGN` capsule: one or more `DNS
+/// Configuration` structures (§3.4 Figure 4).
+///
+/// There is deliberately **no** count of DNS Configurations — Figure 4 repeats
+/// `DNS Configuration (..)` to the end of the value, and each configuration is
+/// self-delimiting because every list inside it carries its own count. Adding a
+/// count would corrupt the first configuration's Nameserver Count and break
+/// interoperability with `connect-ip-go`, which likewise parses until the value
+/// is exhausted.
+///
+/// The caller is responsible for the invariants the encoder cannot express —
+/// notably §3.2's non-zero Service Priority and its address-count rule; see the
+/// builder in `config.rs`, which is where administrator input is validated.
+pub fn encode_dns_value(configs: &[DnsConfiguration]) -> Bytes {
+    let mut v = BytesMut::new();
+
+    for cfg in configs {
+        put_varint(&mut v, cfg.nameservers.len() as u64);
+        for ns in &cfg.nameservers {
+            v.put_u16(ns.service_priority);
+            put_varint(&mut v, ns.ipv4.len() as u64);
+            for a in &ns.ipv4 {
+                v.extend_from_slice(&a.octets());
+            }
+            put_varint(&mut v, ns.ipv6.len() as u64);
+            for a in &ns.ipv6 {
+                v.extend_from_slice(&a.octets());
+            }
+            put_domain(&mut v, &ns.auth_domain);
+            put_varint(&mut v, ns.service_parameters.len() as u64);
+            v.extend_from_slice(&ns.service_parameters);
+        }
+        put_varint(&mut v, cfg.internal_domains.len() as u64);
+        for d in &cfg.internal_domains {
+            put_domain(&mut v, d);
+        }
+        put_varint(&mut v, cfg.search_domains.len() as u64);
+        for d in &cfg.search_domains {
+            put_domain(&mut v, d);
+        }
+    }
+
+    v.freeze()
+}
+
+/// Parse the payload of a `DNS_ASSIGN` capsule, consuming configurations until
+/// the value is exhausted (see [`encode_dns_value`] for why there is no outer
+/// count). Returns `None` on malformed input: truncation, a Service Priority of
+/// 0 (§3.2), over-long domains or Service Parameters, or non-UTF-8 names.
+pub fn decode_dns_value(value: &[u8]) -> Option<Vec<DnsConfiguration>> {
+    let mut buf = value;
+    let mut configs = Vec::new();
+
+    while !buf.is_empty() {
+        let ns_count = get_varint(&mut buf)?;
+        let mut nameservers = Vec::new();
+        for _ in 0..ns_count {
+            if buf.len() < 2 {
+                return None;
+            }
+            let service_priority = u16::from_be_bytes([buf[0], buf[1]]);
+            buf = &buf[2..];
+            // §3.2: ServiceMode requires a non-zero priority.
+            if service_priority == 0 {
+                return None;
+            }
+
+            let v4_count = get_varint(&mut buf)? as usize;
+            let mut ipv4 = Vec::new();
+            for _ in 0..v4_count {
+                if buf.len() < 4 {
+                    return None;
+                }
+                ipv4.push(Ipv4Addr::from([buf[0], buf[1], buf[2], buf[3]]));
+                buf = &buf[4..];
+            }
+
+            let v6_count = get_varint(&mut buf)? as usize;
+            let mut ipv6 = Vec::new();
+            for _ in 0..v6_count {
+                if buf.len() < 16 {
+                    return None;
+                }
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&buf[..16]);
+                buf = &buf[16..];
+                ipv6.push(Ipv6Addr::from(octets));
+            }
+
+            let auth_domain = get_domain(&mut buf)?;
+
+            let params_len = get_varint(&mut buf)? as usize;
+            if params_len > MAX_SERVICE_PARAMETERS_LEN || buf.len() < params_len {
+                return None;
+            }
+            let service_parameters = Bytes::copy_from_slice(&buf[..params_len]);
+            buf = &buf[params_len..];
+
+            nameservers.push(DnsNameserver {
+                service_priority,
+                ipv4,
+                ipv6,
+                auth_domain,
+                service_parameters,
+            });
+        }
+
+        let internal_domains = get_domain_list(&mut buf)?;
+        let search_domains = get_domain_list(&mut buf)?;
+
+        configs.push(DnsConfiguration {
+            nameservers,
+            internal_domains,
+            search_domains,
+        });
+    }
+
+    Some(configs)
+}
+
+/// Encode a full `DNS_ASSIGN` capsule (TLV + payload).
+pub fn encode_dns_assign(configs: &[DnsConfiguration]) -> Bytes {
+    encode_capsule(CAPSULE_DNS_ASSIGN, &encode_dns_value(configs))
+}
+
+/// Decode a full `DNS_ASSIGN` capsule (TLV + payload), or `None`.
+pub fn decode_dns_assign(capsule: &[u8]) -> Option<Vec<DnsConfiguration>> {
+    match decode_capsule(capsule) {
+        Some((CAPSULE_DNS_ASSIGN, v)) => decode_dns_value(&v),
+        _ => None,
+    }
+}
+
+/// Encode the payload of a `PREF64` capsule (§4.1 Figure 7): a bare run of 13-
+/// byte `NAT64 Prefix` structures — no count, no length field. An empty slice
+/// encodes an empty capsule, which tells the peer that no NAT64 prefixes are
+/// available (§4.2).
+pub fn encode_pref64_value(prefixes: &[Nat64Prefix]) -> Bytes {
+    let mut v = BytesMut::with_capacity(prefixes.len() * 13);
+    for p in prefixes {
+        v.put_u8(p.prefix_len);
+        v.extend_from_slice(&p.prefix);
+    }
+    v.freeze()
+}
+
+/// Parse the payload of a `PREF64` capsule. Returns `None` when the value is
+/// malformed per §4.2: a length that is not a multiple of 13 bytes, or a Prefix
+/// Length outside [`NAT64_PREFIX_LENGTHS`]. An empty value yields an empty vec.
+pub fn decode_pref64_value(value: &[u8]) -> Option<Vec<Nat64Prefix>> {
+    // §4.2: a length that is not a multiple of 13 bytes is malformed. `as_chunks`
+    // gives us the remainder directly, so this one call is both the length check
+    // and the iteration.
+    let (chunks, remainder) = value.as_chunks::<13>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    let mut prefixes = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let prefix_len = chunk[0];
+        if !NAT64_PREFIX_LENGTHS.contains(&prefix_len) {
+            return None;
+        }
+        let mut prefix = [0u8; 12];
+        prefix.copy_from_slice(&chunk[1..13]);
+        prefixes.push(Nat64Prefix { prefix_len, prefix });
+    }
+    Some(prefixes)
+}
+
+/// Encode a full `PREF64` capsule (TLV + payload).
+pub fn encode_pref64(prefixes: &[Nat64Prefix]) -> Bytes {
+    encode_capsule(CAPSULE_PREF64, &encode_pref64_value(prefixes))
+}
+
+/// Decode a full `PREF64` capsule (TLV + payload), or `None`.
+pub fn decode_pref64(capsule: &[u8]) -> Option<Vec<Nat64Prefix>> {
+    match decode_capsule(capsule) {
+        Some((CAPSULE_PREF64, v)) => decode_pref64_value(&v),
+        _ => None,
+    }
+}
+
+/// The CONNECT-IP DNS/NAT64 signalling capsules for an installation, encoded
+/// **once** at startup: the configuration is static, so every session sends the
+/// same bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectIpCapsules {
+    /// Encoded `DNS_ASSIGN`, or `None` when no resolver is configured — in which
+    /// case no DNS capsule is sent at all, preserving the pre-existing
+    /// behaviour.
+    pub dns_assign: Option<Bytes>,
+    /// Encoded `PREF64`, or `None` when no NAT64 prefix is configured.
+    pub pref64: Option<Bytes>,
+}
+
+impl ConnectIpCapsules {
+    /// True when neither DNS nor NAT64 is configured, i.e. nothing extra goes on
+    /// the request stream.
+    pub fn is_empty(&self) -> bool {
+        self.dns_assign.is_none() && self.pref64.is_none()
     }
 }
 
@@ -659,5 +975,236 @@ mod tests {
 
         // Empty payload is a valid zero-range capsule.
         assert_eq!(decode_route_value(&[]), Some(Vec::new()));
+    }
+
+    // -- DNS_ASSIGN / PREF64 (draft-ietf-masque-connect-ip-dns-06) ----------
+
+    fn split_tunnel() -> DnsConfiguration {
+        DnsConfiguration {
+            nameservers: vec![DnsNameserver {
+                service_priority: 1,
+                ipv4: vec![Ipv4Addr::new(192, 0, 2, 33)],
+                ipv6: vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)],
+                auth_domain: String::new(),
+                service_parameters: Bytes::new(),
+            }],
+            internal_domains: vec!["internal.corp.example.".to_string()],
+            search_domains: Vec::new(),
+        }
+    }
+
+    /// DNS_ASSIGN carrying §3.6.2's split-tunnel nameserver, byte-for-byte per
+    /// §3.2/§3.3: `DNS Configuration { Nameserver Count (i), Nameserver { Service
+    /// Priority (16), IPv4 Address Count (i), IPv4 Address (32), IPv6 Address
+    /// Count (i), IPv6 Address (128), Domain, Service Parameters Length (i) },
+    /// Internal Domain Count (i), Internal Domain (..), Search Domain Count (i) }`
+    /// inside the RFC 9297 TLV. The capsule Type 0x1ACE79EC is > 0x3fff so it
+    /// takes the 4-byte varint form: `0x8000_0000 | 0x1ACE79EC = 0x9ACE79EC`.
+    #[test]
+    fn dns_assign_split_tunnel_exact_bytes() {
+        let capsule = encode_dns_assign(std::slice::from_ref(&split_tunnel()));
+        // NOTE: the value carries no count of DNS Configurations — it begins
+        // directly with the first configuration's Nameserver Count. See
+        // `encode_dns_value`.
+        let mut expected: Vec<u8> = vec![
+            0x9A, 0xCE, 0x79, 0xEC, // Type = DNS_ASSIGN (4-byte varint)
+            0x34, // Length = 52
+            0x01, // Nameserver Count = 1
+            0x00, 0x01, // Service Priority = 1
+            0x01, // IPv4 Address Count = 1
+            0xC0, 0x00, 0x02, 0x21, // 192.0.2.33
+            0x01, // IPv6 Address Count = 1
+            0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, // 2001:db8::1
+            0x00, // Authentication Domain Name = "" (empty Domain)
+            0x00, // Service Parameters Length = 0
+            0x01, // Internal Domain Count = 1
+            0x16, // Domain Length = 22
+        ];
+        expected.extend_from_slice(b"internal.corp.example.");
+        expected.push(0x00); // Search Domain Count = 0
+
+        assert_eq!(
+            expected.len(),
+            4 + 1 + 52,
+            "fixture length must match: Type (4-byte varint) + Length (1) + 52-byte value"
+        );
+        assert_eq!(capsule.as_ref(), &expected[..]);
+        let parsed = decode_dns_assign(&expected).expect("parse");
+        assert_eq!(parsed, vec![split_tunnel()]);
+    }
+
+    /// PREF64 signalling `64:ff9b::/96`, byte-for-byte from §4.3. Type
+    /// 0x274C0FBC takes the 4-byte varint form `0x8000_0000 | 0x274C0FBC`.
+    #[test]
+    fn pref64_well_known_prefix_exact_bytes() {
+        let mut prefix = [0u8; 12];
+        prefix[..4].copy_from_slice(&[0x00, 0x64, 0xff, 0x9b]);
+        let capsule = encode_pref64(&[Nat64Prefix {
+            prefix_len: 96,
+            prefix,
+        }]);
+        let expected: &[u8] = &[
+            0xA7, 0x4C, 0x0F, 0xBC, // Type = PREF64 (4-byte varint)
+            0x0D, // Length = 13
+            0x60, // Prefix Length = 96
+            0x00, 0x64, 0xFF, 0x9B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, // Prefix (always 96 bits)
+        ];
+        assert_eq!(capsule.as_ref(), expected);
+    }
+
+    #[test]
+    fn pref64_round_trip_multiple_prefixes() {
+        let mut local = [0u8; 12];
+        local[..6].copy_from_slice(&[0x00, 0x64, 0xff, 0x9b, 0x00, 0x01]);
+        let prefixes = vec![
+            Nat64Prefix {
+                prefix_len: 96,
+                prefix: local,
+            },
+            Nat64Prefix {
+                prefix_len: 32,
+                prefix: local,
+            },
+        ];
+        let capsule = encode_pref64(&prefixes);
+        let parsed = decode_pref64(&capsule).expect("decode PREF64");
+        assert_eq!(parsed, prefixes);
+
+        // §4.2: an empty capsule means "no NAT64 prefixes are available".
+        let empty = encode_pref64(&[]);
+        assert_eq!(decode_pref64(&empty), Some(Vec::new()));
+    }
+
+    #[test]
+    fn pref64_rejects_malformed() {
+        // Not a multiple of 13 bytes (§4.2).
+        assert!(decode_pref64_value(&[0x60, 0x00, 0x64]).is_none());
+        assert!(decode_pref64_value(&[0x00; 12]).is_none());
+        assert!(decode_pref64_value(&[0x00; 14]).is_none());
+
+        // Prefix Length outside the permitted set (RFC 6052 §2.2 sizes).
+        for bad_len in [0u8, 1, 31, 33, 65, 95, 97, 128, 255] {
+            let mut value = vec![bad_len];
+            value.extend_from_slice(&[0x00; 12]);
+            assert!(
+                decode_pref64_value(&value).is_none(),
+                "prefix length {bad_len} must be rejected"
+            );
+        }
+        // 13 bytes but the *first* of two prefixes is invalid.
+        let mut two = vec![0x60];
+        two.extend_from_slice(&[0x00; 12]);
+        two.push(0x0F); // not a valid NAT64 length
+        two.extend_from_slice(&[0x00; 12]);
+        assert!(decode_pref64_value(&two).is_none());
+    }
+
+    #[test]
+    fn dns_value_round_trip_multiple_configurations() {
+        let configs = vec![
+            split_tunnel(),
+            DnsConfiguration {
+                nameservers: vec![
+                    DnsNameserver {
+                        service_priority: 1,
+                        ipv4: vec![],
+                        ipv6: vec![],
+                        auth_domain: "masque.example.org.".to_string(),
+                        // Stand-in SvcParams bytes; this layer treats them as
+                        // opaque.
+                        service_parameters: Bytes::from_static(&[0x00, 0x01, 0x02]),
+                    },
+                    DnsNameserver {
+                        service_priority: 42,
+                        ipv4: vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)],
+                        ipv6: vec![Ipv6Addr::LOCALHOST],
+                        auth_domain: String::new(),
+                        service_parameters: Bytes::new(),
+                    },
+                ],
+                internal_domains: vec![String::new()], // DNS root = resolves all
+                search_domains: vec!["corp.example.".to_string(), "example.".to_string()],
+            },
+        ];
+        let capsule = encode_dns_assign(&configs);
+        let (t, v) = decode_capsule(&capsule).expect("decode DNS_ASSIGN");
+        assert_eq!(t, CAPSULE_DNS_ASSIGN);
+        assert_eq!(decode_dns_value(&v).expect("parse dns value"), configs);
+    }
+
+    #[test]
+    fn dns_value_rejects_malformed() {
+        let base = encode_dns_value(&[split_tunnel()]);
+
+        // Service Priority 0 is forbidden in ServiceMode (§3.2).
+        let mut zero_priority = base.to_vec();
+        zero_priority[1] = 0x00; // Service Priority occupies value[1..3]
+        zero_priority[2] = 0x00;
+        assert!(decode_dns_value(&zero_priority).is_none());
+
+        // Appending garbage does not make a *longer* configuration: it would
+        // start a second DNS Configuration that cannot be parsed in full.
+        let mut trailing = base.to_vec();
+        trailing.push(0x00);
+        assert!(decode_dns_value(&trailing).is_none());
+
+        // Truncated: cut the search-domain count off the end.
+        assert!(decode_dns_value(&base[..base.len() - 1]).is_none());
+
+        // Truncated mid-IPv6-address.
+        assert!(decode_dns_value(&base[..10]).is_none());
+
+        // Domain Length larger than the value actually holds.
+        let mut bad_domain: Vec<u8> = vec![
+            0x01, // Nameserver Count = 1
+            0x00, 0x01, // Service Priority
+            0x00, // IPv4 Count
+            0x00, // IPv6 Count
+            0xFF, // Domain Length = 255 (claims far more than we send)
+        ];
+        bad_domain.extend_from_slice(b"short.example.");
+        bad_domain.push(0x00); // Service Parameters Length
+        bad_domain.push(0x00); // Internal Domain Count
+        bad_domain.push(0x00); // Search Domain Count
+        assert!(decode_dns_value(&bad_domain).is_none());
+
+        // Non-UTF-8 Domain Name (an IDNA A-label is ASCII, §3.1).
+        let mut non_utf8: Vec<u8> = vec![
+            0x01, 0x00, 0x01, 0x00, 0x00, 0x02, // Domain Length = 2
+        ];
+        non_utf8.extend_from_slice(&[0xC3, 0x28]); // invalid UTF-8 sequence
+        non_utf8.push(0x00); // Service Parameters Length
+        non_utf8.push(0x00); // Internal Domain Count
+        non_utf8.push(0x00); // Search Domain Count
+        assert!(decode_dns_value(&non_utf8).is_none());
+
+        // A header-only value cannot be completed.
+        assert!(decode_dns_value(&[0x01, 0x00]).is_none());
+
+        // Zero DNS Configurations is a legitimate zero-length value, same as
+        // ADDRESS_ASSIGN / ROUTE_ADVERTISEMENT.
+        assert_eq!(decode_dns_value(&[]), Some(Vec::new()));
+    }
+
+    #[test]
+    fn connect_ip_capsules_is_empty_only_when_nothing_is_configured() {
+        let none = ConnectIpCapsules {
+            dns_assign: None,
+            pref64: None,
+        };
+        assert!(none.is_empty());
+
+        let dns_only = ConnectIpCapsules {
+            dns_assign: Some(encode_dns_assign(&[split_tunnel()])),
+            pref64: None,
+        };
+        assert!(!dns_only.is_empty());
+
+        let pref64_only = ConnectIpCapsules {
+            dns_assign: None,
+            pref64: Some(encode_pref64(&[])),
+        };
+        assert!(!pref64_only.is_empty());
     }
 }

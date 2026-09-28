@@ -370,6 +370,13 @@ impl MasqueServer {
         #[cfg(not(target_os = "linux"))]
         let ip_pool = ();
 
+        // CONNECT-IP DNS/NAT64 signalling capsules
+        // (draft-ietf-masque-connect-ip-dns-06), encoded once here because they
+        // are identical for every session. Validated at the same point as
+        // `--ip-pool`, so a bad combination fails at startup. Cross-platform:
+        // only the tun data plane below is Linux-gated.
+        let ip_capsules = Arc::new(self.config.connect_ip_capsules()?);
+
         while let Some(incoming) = endpoint.accept().await {
             // Available before the handshake completes, so a failed handshake
             // can still be attributed to a source.
@@ -402,11 +409,13 @@ impl MasqueServer {
             let resolver = resolver.clone();
             let config = self.config.clone();
             let ip_pool = ip_pool.clone();
+            let ip_capsules = ip_capsules.clone();
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_connection(h3_conn, peer, quinn_conn, resolver, config, ip_pool, shutdown)
-                        .await
+                if let Err(e) = handle_connection(
+                    h3_conn, peer, quinn_conn, resolver, config, ip_pool, ip_capsules, shutdown,
+                )
+                .await
                 {
                     debug!(peer = %peer, error = %e, "masque connection ended");
                 }
@@ -419,6 +428,7 @@ impl MasqueServer {
 
 /// Drive one HTTP/3 connection: spawn the connection-wide datagram reader, then
 /// accept `CONNECT-UDP` / `CONNECT-IP` requests, validating and tunnelling each.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut h3_conn: H3Conn,
     peer: SocketAddr,
@@ -428,6 +438,8 @@ async fn handle_connection(
     // CONNECT-IP address pool; unused off-Linux (connect-ip is answered 501).
     #[cfg(target_os = "linux")] pool: Arc<StdMutex<IpPool>>,
     #[cfg(not(target_os = "linux"))] _pool: (),
+    #[cfg(target_os = "linux")] ip_capsules: Arc<capsule::ConnectIpCapsules>,
+    #[cfg(not(target_os = "linux"))] _ip_capsules: Arc<capsule::ConnectIpCapsules>,
     // Shutdown trigger; only the Linux CONNECT-IP data plane consumes it
     // (its tun/NAT teardown must run before process exit).
     #[cfg(target_os = "linux")] shutdown: Shutdown,
@@ -550,6 +562,7 @@ async fn handle_connection(
                 let quinn_conn = quinn_conn.clone();
                 let routes = routes.clone();
                 let pool = pool.clone();
+                let ip_capsules = ip_capsules.clone();
                 let shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_ip_stream(
@@ -562,6 +575,7 @@ async fn handle_connection(
                         stream_id,
                         quinn_conn,
                         pool,
+                        ip_capsules,
                         shutdown,
                     )
                     .await
@@ -791,8 +805,10 @@ where
 /// a PtP link, client = the peer), NATs the client's traffic, and then relays
 /// IP packets between the `tun` device and HTTP/3 DATAGRAMs (Context ID 0 +
 /// raw packet) for the life of the stream. Signalling is on the request
-/// stream: the proxy sends `ADDRESS_ASSIGN` (assigned client address/prefix)
-/// and `ROUTE_ADVERTISEMENT` (default route) as RFC 9297 capsules via
+/// stream: the proxy sends `ADDRESS_ASSIGN` (assigned client address/prefix),
+/// `ROUTE_ADVERTISEMENT` (default route) and — when configured — the
+/// `DNS_ASSIGN` / `PREF64` capsules of
+/// `draft-ietf-masque-connect-ip-dns-06` as RFC 9297 capsules via
 /// `send_data`, and a stream-reader task decodes client capsules
 /// (`ADDRESS_REQUEST` is answered with a matching `ADDRESS_ASSIGN`).
 /// On teardown, dropping `tun` removes the interface, the iptables rules, and
@@ -809,6 +825,10 @@ async fn handle_ip_stream<S>(
     stream_id: StreamId,
     quinn_conn: QuinnConnection,
     pool: Arc<StdMutex<IpPool>>,
+    // Pre-encoded `DNS_ASSIGN` / `PREF64` capsules from `--ip-dns*` /
+    // `--ip-nat64-prefix`; empty when unconfigured, and then nothing beyond
+    // RFC 9484's own capsules is sent.
+    ip_capsules: Arc<capsule::ConnectIpCapsules>,
     shutdown: Shutdown,
 ) -> anyhow::Result<()>
 where
@@ -903,6 +923,28 @@ where
         return Ok(());
     }
 
+    // DNS and NAT64 configuration (draft-ietf-masque-connect-ip-dns-06). Sent
+    // unsolicited — the draft deliberately drops the request/response capsule
+    // pair that revision -03 briefly had, so pushing the assignment is the only
+    // way a client learns about it. Order matters: §5 requires that a
+    // DNS_ASSIGN never precede the ROUTE_ADVERTISEMENT it belongs to, because
+    // acting on a resolver that sits outside the routes would break the
+    // tunnel's privacy properties.
+    if let Some(dns_assign) = ip_capsules.dns_assign.clone()
+        && let Err(e) = req_stream.send_data(dns_assign).await
+    {
+        debug!(peer = %peer, error = %e, "failed to send DNS_ASSIGN capsule");
+        let _ = req_stream.finish().await;
+        return Ok(());
+    }
+    if let Some(pref64) = ip_capsules.pref64.clone()
+        && let Err(e) = req_stream.send_data(pref64).await
+    {
+        debug!(peer = %peer, error = %e, "failed to send PREF64 capsule");
+        let _ = req_stream.finish().await;
+        return Ok(());
+    }
+
     // Split the request stream: the send half answers client ADDRESS_REQUEST
     // capsules and finishes the stream at EOF; the recv half is decoded as an
     // RFC 9297 capsule sequence by a dedicated reader task.
@@ -980,6 +1022,29 @@ where
                                     None => debug!(peer = %peer, "malformed client ROUTE_ADVERTISEMENT ignored"),
                                 }
                             }
+                            // draft-06 §3.5 / §4.2: the IP proxy does not take
+                            // DNS or NAT64 configuration from the client — we
+                            // are the one handing it out, and letting a client
+                            // pick its own resolver would defeat the point.
+                            // Parsed purely for observability.
+                            capsule::CAPSULE_DNS_ASSIGN => {
+                                match capsule::decode_dns_value(&value) {
+                                    Some(cfgs) => debug!(
+                                        peer = %peer,
+                                        configurations = cfgs.len(),
+                                        "client DNS_ASSIGN ignored (draft-06 3.5)"
+                                    ),
+                                    None => debug!(peer = %peer, "malformed client DNS_ASSIGN ignored"),
+                                }
+                            }
+                            capsule::CAPSULE_PREF64 => match capsule::decode_pref64_value(&value) {
+                                Some(prefixes) => debug!(
+                                    peer = %peer,
+                                    prefixes = prefixes.len(),
+                                    "client PREF64 ignored (draft-06 4.2)"
+                                ),
+                                None => debug!(peer = %peer, "malformed client PREF64 ignored"),
+                            },
                             // ADDRESS_ASSIGN and anything else: accept and
                             // ignore gracefully.
                             _ => debug!(peer = %peer, type_ = typ, "ignoring unknown CONNECT-IP capsule"),

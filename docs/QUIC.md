@@ -156,9 +156,13 @@ auto-server --enable h3 --key xxx.pem --cert-chain xxxfull.chain.pem --h3-bind 0
 | Flag | Meaning |
 | --- | --- |
 | `--enable h3` | Enable the HTTP/3 MASQUE mode (the only accepted value today). |
-| `--key <PATH>` | PEM private key for the QUIC/HTTP/3 listener. **Required** when `--enable h3`. |
-| `--cert-chain <PATH>` | PEM certificate chain (fullchain) for the QUIC/HTTP/3 listener. **Required** when `--enable h3`. |
+| `--key <PATH>` | PEM private key for the QUIC/HTTP/3 listener. **Required** when `--enable h3` unless `--acme-ip` is set (when both are passed, ACME writes the key here). |
+| `--cert-chain <PATH>` | PEM certificate chain (fullchain) for the QUIC/HTTP/3 listener. **Required** when `--enable h3` unless `--acme-ip` is set (when both are passed, ACME writes the chain here). |
 | `--auth-token <TOKEN>` | Shared secret. **Required** when `--enable h3`. See auth below. |
+| `--acme-ip [IP[,IP...]\|auto]` | Automatically issue and renew a Let's Encrypt short-lived TLS certificate for one or more public IP addresses (RFC 8738 + `shortlived` ACME profile, HTTP-01 with automatic TLS-ALPN-01 TCP/443 fallback). Pass an explicit public IPv4/IPv6 (comma-separated for dual-stack multi-SAN), or `auto` (or omit the value) to check local network interfaces for non-RFC-6890 public IPs first and fall back to `ifconfig.io` when behind NAT. Requires `--enable h3`. |
+| `--acme-dir <DIR>` | Directory to persist the ACME account key (`account.pem`), issued certificate (`fullchain.pem`, `key.pem`), and metadata (`meta.json`). Default `/var/lib/auto-server/acme`. |
+| `--acme-http-bind <ADDR:PORT>` | Local TCP bind address for the temporary ACME HTTP-01 challenge listener during issuance/renewal. Default `0.0.0.0:80` (bound only while validating, then closed). |
+| `--acme-directory-url <URL>` | ACME v2 directory endpoint URL. Default `https://acme-v02.api.letsencrypt.org/directory`. |
 | `--h3-bind <ADDR:PORT>` | Full bind address (IP:port) for the QUIC listener. **Optional, default `0.0.0.0:443`.** Independent of `--listen`: the TCP proxy and the MASQUE endpoint each have their own bind address. |
 | `--max-mtu <BYTES>` | Cap the QUIC datagram size when the path has a smaller MTU (avoids blackholed/fragmented handshakes). Must be >= 1200 (the QUIC minimum). See below. |
 | `--cert-reload-secs <SECONDS>` | Poll `--cert-chain`/`--key` every N seconds and hot-swap the TLS certificate when their contents change (symlink rotation friendly). Default 60; `0` disables polling. See below. |
@@ -167,9 +171,37 @@ auto-server --enable h3 --key xxx.pem --cert-chain xxxfull.chain.pem --h3-bind 0
 `--listen` is purely the TCP proxy's bind address (SOCKS4/SOCKS5/HTTP CONNECT, default
 `0.0.0.0:1080`); it has no influence on the MASQUE bind, which is `--h3-bind` alone.
 
-`--key`, `--cert-chain`, and `--auth-token` are enforced by `clap` (`required_if_eq` on
-`--enable h3`) and re-checked defensively in `run()`. Omitting any of them aborts with a clear
-message before binding.
+`--auth-token` is enforced by `clap` (`required_if_eq` on `--enable h3`), and `validate()`
+enforces that either `--key` + `--cert-chain` or `--acme-ip` is configured before binding.
+
+### `--acme-ip` (automatic Let's Encrypt public IP certificates)
+
+Let's Encrypt supports issuing TLS certificates directly for public IPv4/IPv6 addresses using the
+`shortlived` ACME profile (160-hour / ~6.6-day validity, HTTP-01 on TCP/80 or TLS-ALPN-01 on
+TCP/443). Dual-stack hosts can place both public IPv4 and IPv6 addresses as `iPAddress` SANs in a
+single certificate (and fall back cleanly to single-IP issuance if one family fails):
+
+```
+auto-server --enable h3 --auth-token <TOKEN> --acme-ip auto
+# or with explicit public IPv4 + IPv6:
+auto-server --enable h3 --auth-token <TOKEN> --acme-ip 203.0.113.10,2001:db8::10
+```
+
+- **Startup:** inspects cached PEM files in `--acme-dir` (or `--cert-chain`/`--key` if given);
+  reuses them if all expected IP SANs match, the cert/key pair validates, and at least 48h of
+  lifetime remains. Otherwise tries HTTP-01 on `--acme-http-bind` (default `0.0.0.0:80`) and
+  automatically falls back to **TLS-ALPN-01 on TCP port 443** if port 80 is already occupied
+  (e.g. by Caddy/Nginx), persists `account.pem`/`fullchain.pem`/`key.pem`/`meta.json`, and
+  unbinds the temporary validation socket before starting QUIC.
+- **Background renewal:** checks every 6 hours and renews automatically when remaining lifetime
+  drops below 72h (or the detected public IPs change in `auto` mode), then hot-swaps the live
+  `quinn::Endpoint` via `set_server_config` with zero downtime.
+- **Public IP detection (`auto`):** checks local network interfaces and default outbound route
+  source addresses for non-RFC-6890 public IPv4 and IPv6 addresses first; if none is assigned
+  locally (e.g. behind NAT), falls back to querying `https://ifconfig.io/ip` (`ifconfig.io`,
+  `api.ipify.org`, `icanhazip.com`, `ifconfig.me/ip`).
+- **Public IP requirement:** RFC 6890 private/loopback/reserved addresses are rejected when using
+  `letsencrypt.org`.
 
 ### `--disable http` (MASQUE-only)
 

@@ -105,15 +105,13 @@ pub struct AppConfig {
 
     #[arg(
         long,
-        required_if_eq("enable", "h3"),
-        help = "PEM private key file for the HTTP/3 (QUIC) listener. Required when --enable h3."
+        help = "PEM private key file for the HTTP/3 (QUIC) listener. Required when --enable h3 unless --acme-ip is set."
     )]
     pub key: Option<String>,
 
     #[arg(
         long,
-        required_if_eq("enable", "h3"),
-        help = "PEM certificate chain (fullchain) file for the HTTP/3 (QUIC) listener. Required when --enable h3."
+        help = "PEM certificate chain (fullchain) file for the HTTP/3 (QUIC) listener. Required when --enable h3 unless --acme-ip is set."
     )]
     pub cert_chain: Option<String>,
 
@@ -123,6 +121,39 @@ pub struct AppConfig {
         help = "Shared secret required on every CONNECT-UDP request (Proxy-Authorization). Required when --enable h3, since UDP/443 is a publicly reachable open-proxy port."
     )]
     pub auth_token: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "IP[,IP...]|auto",
+        num_args = 0..=1,
+        default_missing_value = "auto",
+        help = "Automatically issue and renew a Let's Encrypt short-lived TLS certificate for one or more public IP addresses (RFC 8738, ACME 'shortlived' profile). Pass an explicit public IPv4/IPv6 (comma-separated for dual-stack multi-SAN), or 'auto' (or omit the value) to check local network interfaces first and fall back to ifconfig.io when behind NAT. Uses HTTP-01 (--acme-http-bind) with automatic TLS-ALPN-01 (TCP/443) fallback. Requires --enable h3."
+    )]
+    pub acme_ip: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        default_value = "/var/lib/auto-server/acme",
+        help = "Directory to persist ACME account key, issued certificate/private key, and metadata when --acme-ip is enabled."
+    )]
+    pub acme_dir: String,
+
+    #[arg(
+        long,
+        value_name = "ADDR:PORT",
+        default_value = "0.0.0.0:80",
+        help = "Local TCP bind address for the temporary ACME HTTP-01 challenge listener during certificate issuance/renewal."
+    )]
+    pub acme_http_bind: SocketAddr,
+
+    #[arg(
+        long,
+        value_name = "URL",
+        default_value = "https://acme-v02.api.letsencrypt.org/directory",
+        help = "ACME v2 directory endpoint URL."
+    )]
+    pub acme_directory_url: String,
 
     #[arg(
         long,
@@ -232,6 +263,48 @@ impl AppConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if !self.run_tcp_proxy() && !matches!(self.enable, Some(EnableProtocol::H3)) {
             bail!("--disable http requires --enable h3: nothing would be listening");
+        }
+        if matches!(self.enable, Some(EnableProtocol::H3)) {
+            if self.auth_token.is_none() {
+                bail!("--enable h3 requires --auth-token");
+            }
+            if self.acme_ip.is_none() {
+                if self.key.is_none() || self.cert_chain.is_none() {
+                    bail!("--enable h3 requires --key and --cert-chain (or --acme-ip)");
+                }
+            } else if self.key.is_some() != self.cert_chain.is_some() {
+                bail!("--key and --cert-chain must be specified together");
+            }
+        } else if self.acme_ip.is_some() {
+            bail!("--acme-ip requires --enable h3");
+        }
+        if let Some(raw) = &self.acme_ip {
+            let trimmed = raw.trim();
+            if !trimmed.eq_ignore_ascii_case("auto") {
+                let mut count = 0usize;
+                for part in trimmed.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    count += 1;
+                    let ip: IpAddr = part.parse().with_context(|| {
+                        format!(
+                            "--acme-ip: {part:?} is not a valid IPv4/IPv6 address or 'auto'"
+                        )
+                    })?;
+                    if self
+                        .acme_directory_url
+                        .to_ascii_lowercase()
+                        .contains("letsencrypt.org")
+                        && crate::server::is_rfc6890_special(ip)
+                    {
+                        bail!(
+                            "--acme-ip: {ip} is a special-purpose/private/loopback (RFC 6890) address; \
+                             Let's Encrypt only issues certificates for publicly routable IP addresses"
+                        );
+                    }
+                }
+                if count == 0 {
+                    bail!("--acme-ip: expected one or more IP addresses or 'auto'");
+                }
+            }
         }
         if let Some(mtu) = self.max_mtu
             && mtu < 1200
@@ -710,5 +783,118 @@ mod tests {
             .connect_ip_capsules()
             .expect_err("over-long label must be rejected");
         assert!(err.to_string().contains("63-octet"), "got: {err}");
+    }
+
+    // -- ACME public IP issuance flags ----------------------------------------
+
+    #[test]
+    fn acme_ip_explicit_and_auto_are_valid() {
+        let explicit = config_from(&[
+            "--enable",
+            "h3",
+            "--auth-token",
+            "s3cr3t",
+            "--acme-ip",
+            "203.0.113.10",
+            "--acme-directory-url",
+            "https://mock.acme.test/directory",
+        ]);
+        assert_eq!(explicit.acme_ip.as_deref(), Some("203.0.113.10"));
+        explicit.validate().expect("explicit IP with non-LE dir is valid");
+
+        let public_le = config_from(&[
+            "--enable",
+            "h3",
+            "--auth-token",
+            "s3cr3t",
+            "--acme-ip",
+            "1.1.1.1",
+        ]);
+        public_le.validate().expect("public IP with LE dir is valid");
+
+        let auto_explicit = config_from(&[
+            "--enable",
+            "h3",
+            "--auth-token",
+            "s3cr3t",
+            "--acme-ip",
+            "auto",
+        ]);
+        assert_eq!(auto_explicit.acme_ip.as_deref(), Some("auto"));
+        auto_explicit.validate().expect("auto mode is valid");
+
+        let bare = config_from(&[
+            "--enable",
+            "h3",
+            "--auth-token",
+            "s3cr3t",
+            "--acme-ip",
+            "--h3-bind",
+            "0.0.0.0:8443",
+        ]);
+        assert_eq!(bare.acme_ip.as_deref(), Some("auto"));
+        assert_eq!(bare.h3_bind.port(), 8443);
+        bare.validate().expect("bare --acme-ip defaults to auto");
+
+        let dual_stack = config_from(&[
+            "--enable",
+            "h3",
+            "--auth-token",
+            "s3cr3t",
+            "--acme-ip",
+            "1.1.1.1,2606:4700:4700::1111",
+        ]);
+        dual_stack.validate().expect("comma-separated dual-stack IPv4+IPv6 is valid");
+    }
+
+    #[test]
+    fn acme_ip_validation_rejects_invalid_combinations() {
+        let no_h3 = config_from(&["--acme-ip", "1.1.1.1"])
+            .validate()
+            .expect_err("--acme-ip without --enable h3 must fail");
+        assert!(no_h3.to_string().contains("--enable h3"));
+
+        let h3_no_creds = config_from(&["--enable", "h3", "--auth-token", "s3cr3t"])
+            .validate()
+            .expect_err("--enable h3 without key/cert or acme-ip must fail");
+        assert!(h3_no_creds.to_string().contains("--acme-ip"));
+
+        let half_manual = config_from(&[
+            "--enable",
+            "h3",
+            "--auth-token",
+            "s3cr3t",
+            "--acme-ip",
+            "1.1.1.1",
+            "--key",
+            "key.pem",
+        ])
+        .validate()
+        .expect_err("half manual key/cert must fail");
+        assert!(half_manual.to_string().contains("together"));
+
+        let bad_ip = config_from(&[
+            "--enable",
+            "h3",
+            "--auth-token",
+            "s3cr3t",
+            "--acme-ip",
+            "example.com",
+        ])
+        .validate()
+        .expect_err("domain name for --acme-ip must fail");
+        assert!(bad_ip.to_string().contains("--acme-ip"));
+
+        let private_le = config_from(&[
+            "--enable",
+            "h3",
+            "--auth-token",
+            "s3cr3t",
+            "--acme-ip",
+            "127.0.0.1",
+        ])
+        .validate()
+        .expect_err("RFC 6890 IP against letsencrypt.org must fail");
+        assert!(private_le.to_string().contains("RFC 6890"));
     }
 }

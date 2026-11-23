@@ -183,7 +183,7 @@ pub fn apply_max_mtu(
 /// service rotates material), plus the `EndpointConfig` to bind the listener
 /// with. Used at startup and on every reload tick, so a hot-swapped config is
 /// always rebuilt the same way — including any `--max-mtu` transport caps.
-async fn build_quic_server_config(
+pub(crate) async fn build_quic_server_config(
     cert_path: &str,
     key_path: &str,
     max_mtu: Option<u16>,
@@ -306,13 +306,17 @@ pub struct MasqueServer {
 
 impl MasqueServer {
     pub fn new(config: AppConfig) -> anyhow::Result<Self> {
-        // Fail fast if the crypto material is missing or unreadable. The CLI
-        // already requires these via `required_if_eq`, but verify eagerly so a
-        // bad path surfaces at startup rather than on first handshake.
-        if config.key.is_none() || config.cert_chain.is_none() || config.auth_token.is_none() {
+        // Fail fast if required credentials are missing.
+        if config.auth_token.is_none() {
+            anyhow::bail!("--enable h3 requires --auth-token to be set");
+        }
+        if config.acme_ip.is_none() && (config.key.is_none() || config.cert_chain.is_none()) {
             anyhow::bail!(
-                "--enable h3 requires --key, --cert-chain and --auth-token to be set"
+                "--enable h3 requires --key and --cert-chain (or --acme-ip) to be set"
             );
+        }
+        if config.key.is_some() != config.cert_chain.is_some() {
+            anyhow::bail!("--key and --cert-chain must be specified together");
         }
         Ok(Self { config })
     }
@@ -321,8 +325,16 @@ impl MasqueServer {
     /// triggered (`shutdown`); every connection task gets a clone so CONNECT-IP
     /// sessions observe the shutdown and tear their tun/NAT state down.
     pub async fn run(self, shutdown: Shutdown) -> anyhow::Result<()> {
-        let cert_path = self.config.cert_chain.as_deref().unwrap().to_string();
-        let key_path = self.config.key.as_deref().unwrap().to_string();
+        let (cert_path, key_path, acme_mgr) = if self.config.acme_ip.is_some() {
+            let mgr = crate::acme::AcmeManager::prepare(&self.config).await?;
+            (mgr.cert_path_str(), mgr.key_path_str(), Some(mgr))
+        } else {
+            (
+                self.config.cert_chain.as_deref().unwrap().to_string(),
+                self.config.key.as_deref().unwrap().to_string(),
+                None,
+            )
+        };
         let max_mtu = self.config.max_mtu;
 
         let (server_cfg, endpoint_cfg) =
@@ -342,6 +354,10 @@ impl MasqueServer {
             Arc::new(quinn::TokioRuntime),
         )
         .with_context(|| format!("failed to start MASQUE/QUIC endpoint on {addr}"))?;
+
+        if let Some(mgr) = acme_mgr {
+            mgr.spawn_renewal_loop(endpoint.clone(), max_mtu, shutdown.clone());
+        }
 
         // Periodic TLS certificate hot-reload (0 disables polling). The endpoint
         // is internally Arc-shared, so a clone is enough to hand the reloader
@@ -1212,7 +1228,7 @@ fn is_connect_ip_path(path: &str) -> bool {
 /// extension: h3 0.0.8 cannot parse `connect-ip` as a `:protocol` at all (see
 /// `MASQUE_IP_PATH`), so once h3 learns it, the path is still a valid
 /// discriminator and a stray `connect-udp` on this path is rejected below.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn validate_connect_ip(req: &Request<()>, token: Option<&str>) -> Result<(), StatusCode> {
     if req.method() != Method::CONNECT {
         return Err(StatusCode::METHOD_NOT_ALLOWED);
@@ -2305,6 +2321,7 @@ mod e2e {
     use h3::ext::Protocol;
     use h3_datagram::datagram_handler::HandleDatagramsExt;
     use h3_quinn::Connection as H3QuinnConnection;
+    #[cfg(target_os = "linux")]
     use libc;
     use quinn::{ClientConfig, Endpoint, TransportConfig};
     use rustls::RootCertStore;
@@ -2313,6 +2330,7 @@ mod e2e {
     use tokio::net::{TcpListener, UdpSocket};
     use tokio::sync::mpsc;
 
+    #[cfg(target_os = "linux")]
     use crate::capsule;
     use crate::config::Cli;
     use super::MasqueServer;
@@ -2335,6 +2353,7 @@ mod e2e {
     /// The client here is deliberately written to RFC 9484 directly (hand-built
     /// bytes, no shared codec) so it verifies the *wire format*, not our own
     /// encoder round-tripping itself.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires openssl + root (CAP_NET_ADMIN); run: cargo test -- --ignored e2e_connect_ip_roundtrip"]
     async fn e2e_connect_ip_roundtrip() -> anyhow::Result<()> {
@@ -2584,6 +2603,7 @@ mod e2e {
     /// Build a well-formed ICMPv4 echo request (`src -> dst`) as a raw IPv4
     /// packet with correct header/ICMP checksums. Used by the root-gated
     /// CONNECT-IP e2e.
+    #[cfg(target_os = "linux")]
     fn icmpv4_echo_request(
         src: std::net::Ipv4Addr,
         dst: std::net::Ipv4Addr,
@@ -2620,6 +2640,7 @@ mod e2e {
     }
 
     /// RFC 1071 internet checksum.
+    #[cfg(target_os = "linux")]
     fn ip_checksum(bytes: &[u8]) -> u16 {
         let mut sum = 0u32;
         for pair in bytes.chunks(2) {

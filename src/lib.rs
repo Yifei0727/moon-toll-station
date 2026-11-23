@@ -1,3 +1,4 @@
+pub mod acme;
 pub mod capsule;
 pub mod config;
 pub mod logging;
@@ -42,14 +43,9 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     match config.enable {
         // HTTP/3 MASQUE runs *alongside* the existing TCP SOCKS/HTTP proxy.
         Some(EnableProtocol::H3) => {
-            // Defensive runtime check: the flags above only apply when --enable
-            // h3; if somehow the (clap-enforced) requirements are missing, bail
-            // with a clear message rather than failing obscurely at handshake.
-            if config.key.is_none() || config.cert_chain.is_none() || config.auth_token.is_none() {
-                anyhow::bail!(
-                    "--enable h3 requires --key, --cert-chain and --auth-token to be set"
-                );
-            }
+            // Defensive runtime check: config.validate() ensures --auth-token
+            // is set and either --key/--cert-chain or --acme-ip is configured.
+            config.validate()?;
             let masque = masque::MasqueServer::new(config.clone())?;
             // On shutdown the select arms drop the server future(s), which
             // stops accepting (QUIC endpoint / TCP listener); the spawned

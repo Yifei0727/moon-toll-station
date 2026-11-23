@@ -1,6 +1,6 @@
 [package]
 name = "auto-server"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 
 [dependencies]
@@ -25,7 +25,8 @@ quinn = { version = "0.11", default-features = false, features = ["rustls-ring",
 h3 = "0.0.8"
 h3-quinn = { version = "0.0.10", features = ["datagram"] }
 h3-datagram = "0.0.2"
-rustls = "0.23"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+ring = "0.17"
 rustls-pemfile = "2"
 # The OS certificate store is masque-client's default trust root. Already in
 # the tree via reqwest's rustls-tls-native-roots; pinned to the same 0.8 line.
